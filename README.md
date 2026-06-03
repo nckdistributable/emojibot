@@ -77,6 +77,7 @@ Per-user settings are available via `/settings`:
 - `CONCURRENCY` (default: `2`)
 - `ALLOWED_USER_IDS` (comma-separated)
 - `ADMIN_USER_IDS` (comma-separated)
+- `STATS_FILE` (default: `stats.json`) - path to the JSON file where usage stats are persisted. Set to an empty value to disable persistence (in-memory only).
 
 ## Notes
 
@@ -85,3 +86,4 @@ Per-user settings are available via `/settings`:
 - `ffmpeg` is required for video emoji (`.webm` VP9, 100x100, <=3s, <=30fps, <=256KB).
 - `Pillow` is required for images and static stickers. For WebP on macOS, install `webp` via Homebrew and reinstall Pillow.
 - If video emoji limits are not met, the bot returns `.mp4` or `.gif` as a fallback.
+- Usage stats (per-user request counts and aggregate counters) are persisted to `STATS_FILE` (default `stats.json`) and reloaded on startup, so they survive restarts. In Docker, mount a volume for this file to keep stats across container recreation.
