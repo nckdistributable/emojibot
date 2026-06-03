@@ -12,7 +12,7 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, User
 from aiogram.types.input_file import FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -56,12 +56,36 @@ class UserSettings:
 
 
 @dataclass
+class UserStat:
+    user_id: int
+    username: str = ""
+    full_name: str = ""
+    count: int = 0
+    last_seen: float = 0.0
+
+
+@dataclass
 class Stats:
     start_time: float
     counts: dict[str, int] = field(default_factory=dict)
+    users: dict[int, UserStat] = field(default_factory=dict)
 
     def inc(self, key: str) -> None:
         self.counts[key] = self.counts.get(key, 0) + 1
+
+    def record_user(self, user: Optional[User]) -> None:
+        if user is None:
+            return
+        stat = self.users.get(user.id)
+        if stat is None:
+            stat = UserStat(user_id=user.id)
+            self.users[user.id] = stat
+        if user.username:
+            stat.username = user.username
+        if user.full_name:
+            stat.full_name = user.full_name
+        stat.count += 1
+        stat.last_seen = time.time()
 
 
 SUPPORTED_FORMATS_TEXT = (
@@ -547,10 +571,42 @@ async def handle_stats(message: Message) -> None:
     if not is_admin(message.from_user.id if message.from_user else None, config):
         return
     uptime = int(time.monotonic() - stats.start_time)
-    lines = [f"Uptime: {uptime}s"]
+    total_requests = sum(u.count for u in stats.users.values())
+    lines = [f"Uptime: {uptime}s", f"unique_users: {len(stats.users)}"]
+    if total_requests:
+        lines.append(f"total_requests: {total_requests}")
     for key in sorted(stats.counts.keys()):
         lines.append(f"{key}: {stats.counts[key]}")
     await message.answer("\n".join(lines) + "\nStats are looking spooky. 👻✨")
+
+
+def format_user_label(stat: UserStat) -> str:
+    if stat.username:
+        return f"@{stat.username}"
+    if stat.full_name:
+        return stat.full_name
+    return f"id {stat.user_id}"
+
+
+async def handle_users(message: Message) -> None:
+    config = get_config()
+    if not is_admin(message.from_user.id if message.from_user else None, config):
+        return
+    if not stats.users:
+        await message.answer("No requests yet. The void stares back. 👻✨")
+        return
+    ranked = sorted(
+        stats.users.values(), key=lambda u: (u.count, u.last_seen), reverse=True
+    )
+    total = sum(u.count for u in ranked)
+    header = f"Users: {len(ranked)} | Requests: {total}"
+    lines = [header]
+    limit = 50
+    for stat in ranked[:limit]:
+        lines.append(f"{format_user_label(stat)} (id {stat.user_id}): {stat.count}")
+    if len(ranked) > limit:
+        lines.append(f"... and {len(ranked) - limit} more")
+    await message.answer("\n".join(lines) + "\nWho's been summoning me? 👻✨")
 
 
 async def handle_health(message: Message) -> None:
@@ -619,6 +675,7 @@ async def handle_sticker(message: Message, bot: Bot) -> None:
         )
         return
 
+    stats.record_user(message.from_user)
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
 
@@ -675,6 +732,7 @@ async def handle_photo(message: Message, bot: Bot) -> None:
         )
         return
     stats.inc("photo_in")
+    stats.record_user(message.from_user)
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
     file = await bot.get_file(photo.file_id)
@@ -700,6 +758,7 @@ async def handle_animation(message: Message, bot: Bot) -> None:
         )
         return
     stats.inc("animation_in")
+    stats.record_user(message.from_user)
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
     file = await bot.get_file(animation.file_id)
@@ -727,6 +786,7 @@ async def handle_video(message: Message, bot: Bot) -> None:
         )
         return
     stats.inc("video_in")
+    stats.record_user(message.from_user)
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
     file = await bot.get_file(video.file_id)
@@ -754,6 +814,7 @@ async def handle_document(message: Message, bot: Bot) -> None:
         )
         return
     stats.inc("document_in")
+    stats.record_user(message.from_user)
     mime = (doc.mime_type or "").lower()
     doc_duration = getattr(doc, "duration", None)
     user_id = message.from_user.id if message.from_user else 0
@@ -805,6 +866,7 @@ async def main() -> None:
     dp.message.register(handle_help, Command("help"))
     dp.message.register(handle_settings, Command("settings"))
     dp.message.register(handle_stats, Command("stats"))
+    dp.message.register(handle_users, Command("users"))
     dp.message.register(handle_health, Command("health"))
     dp.callback_query.register(
         handle_settings_callback, F.data.startswith("set:")
