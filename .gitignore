@@ -1,11 +1,11 @@
 .venv
-__pycache__
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
 .env
-.git
-.gitignore
 .DS_Store
+
+# Persisted runtime stats
 stats.json
 stats.json.tmp

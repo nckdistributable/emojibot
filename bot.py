@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -43,6 +44,7 @@ class Config:
     allowed_user_ids: set[int] = field(default_factory=set)
     admin_user_ids: set[int] = field(default_factory=set)
     concurrency: int = 2
+    stats_file: str = "stats.json"
 
 
 @dataclass
@@ -69,9 +71,11 @@ class Stats:
     start_time: float
     counts: dict[str, int] = field(default_factory=dict)
     users: dict[int, UserStat] = field(default_factory=dict)
+    path: Optional[Path] = None
 
     def inc(self, key: str) -> None:
         self.counts[key] = self.counts.get(key, 0) + 1
+        self.save()
 
     def record_user(self, user: Optional[User]) -> None:
         if user is None:
@@ -86,6 +90,83 @@ class Stats:
             stat.full_name = user.full_name
         stat.count += 1
         stat.last_seen = time.time()
+        self.save()
+
+    def to_dict(self) -> dict:
+        return {
+            "counts": self.counts,
+            "users": {
+                str(uid): {
+                    "user_id": u.user_id,
+                    "username": u.username,
+                    "full_name": u.full_name,
+                    "count": u.count,
+                    "last_seen": u.last_seen,
+                }
+                for uid, u in self.users.items()
+            },
+        }
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.path)
+        except Exception:
+            logging.getLogger("emojibot").warning(
+                "Failed to persist stats to %s", self.path, exc_info=True
+            )
+
+
+def load_stats(path: Optional[Path]) -> Stats:
+    stats = Stats(start_time=time.monotonic(), path=path)
+    if path is None:
+        return stats
+    if path.parent and not path.parent.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    if not path.exists():
+        return stats
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logging.getLogger("emojibot").warning(
+            "Failed to load stats from %s; starting fresh", path, exc_info=True
+        )
+        return stats
+
+    counts = data.get("counts")
+    if isinstance(counts, dict):
+        for key, value in counts.items():
+            try:
+                stats.counts[str(key)] = int(value)
+            except Exception:
+                continue
+
+    users = data.get("users")
+    if isinstance(users, dict):
+        for raw_id, info in users.items():
+            if not isinstance(info, dict):
+                continue
+            try:
+                user_id = int(info.get("user_id", raw_id))
+                stats.users[user_id] = UserStat(
+                    user_id=user_id,
+                    username=str(info.get("username", "")),
+                    full_name=str(info.get("full_name", "")),
+                    count=int(info.get("count", 0)),
+                    last_seen=float(info.get("last_seen", 0.0)),
+                )
+            except Exception:
+                continue
+    return stats
 
 
 SUPPORTED_FORMATS_TEXT = (
@@ -130,6 +211,7 @@ def load_config() -> Config:
     allowed_user_ids = parse_id_list(os.getenv("ALLOWED_USER_IDS", ""))
     admin_user_ids = parse_id_list(os.getenv("ADMIN_USER_IDS", ""))
     concurrency = parse_int(os.getenv("CONCURRENCY", "2"), 2)
+    stats_file = os.getenv("STATS_FILE", "stats.json").strip()
 
     return Config(
         token=token,
@@ -139,6 +221,7 @@ def load_config() -> Config:
         allowed_user_ids=allowed_user_ids,
         admin_user_ids=admin_user_ids,
         concurrency=max(1, concurrency),
+        stats_file=stats_file,
     )
 
 
@@ -855,9 +938,14 @@ async def main() -> None:
     if not PIL_AVAILABLE:
         logger.warning("Pillow is not available. Image processing will fail.")
 
-    global app_config, semaphore
+    global app_config, semaphore, stats
     app_config = config
     semaphore = asyncio.Semaphore(config.concurrency)
+
+    stats_path = Path(config.stats_file) if config.stats_file else None
+    stats = load_stats(stats_path)
+    if stats_path is not None:
+        logger.info("Stats persistence enabled at %s", stats_path)
 
     bot = Bot(token=config.token)
     dp = Dispatcher()
