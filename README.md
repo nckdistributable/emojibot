@@ -54,7 +54,8 @@ docker compose up --build
 - `/help` - short usage info and a link to @Stickers.
 - `/settings` - adjust fit, background, FPS, and duration.
 - `/health` - simple health check.
-- `/stats` - usage stats (admin only).
+- `/stats` - usage stats, including unique user and total request counts (admin only).
+- `/users` - per-user breakdown of who sent requests and how many times, ranked by request count (admin only).
 
 ## Settings
 
