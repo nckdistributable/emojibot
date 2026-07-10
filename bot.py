@@ -55,6 +55,7 @@ class UserSettings:
     video_bg: str = "black"
     image_fit: str = "pad"
     image_bg: str = "black"
+    image_output: str = "static"
 
 
 @dataclass
@@ -352,6 +353,81 @@ def convert_image_to_png_emoji(
         return False
 
 
+def build_image_video_filter(settings: UserSettings) -> str:
+    if settings.image_fit == "crop":
+        scale = (
+            "scale=100:100:flags=lanczos:force_original_aspect_ratio=increase"
+        )
+        crop = "crop=100:100"
+        filters = [scale, crop]
+    else:
+        color = "0x00000000" if settings.image_bg == "transparent" else "black"
+        scale = (
+            "scale=100:100:flags=lanczos:force_original_aspect_ratio=decrease"
+        )
+        pad = f"pad=100:100:(ow-iw)/2:(oh-ih)/2:color={color}"
+        filters = [scale, pad]
+
+    filters.append(f"fps={settings.video_fps}")
+    return ",".join(filters)
+
+
+def convert_image_to_video_emoji(
+    input_path: Path,
+    output_path: Path,
+    settings: UserSettings,
+    size_limit_bytes: int = 256 * 1024,
+) -> bool:
+    if not command_exists("ffmpeg"):
+        return False
+
+    duration = max(1, min(3, settings.video_duration))
+    video_filter = build_image_video_filter(settings)
+    pix_fmt = "yuva420p" if settings.image_bg == "transparent" else "yuv420p"
+
+    attempts = [
+        {"crf": "32", "speed": "4"},
+        {"crf": "36", "speed": "4"},
+        {"crf": "40", "speed": "6"},
+    ]
+
+    for attempt in attempts:
+        ok = run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-loop",
+                "1",
+                "-i",
+                str(input_path),
+                "-t",
+                str(duration),
+                "-vf",
+                video_filter,
+                "-an",
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                pix_fmt,
+                "-auto-alt-ref",
+                "0",
+                "-b:v",
+                "0",
+                "-crf",
+                attempt["crf"],
+                "-speed",
+                attempt["speed"],
+                str(output_path),
+            ]
+        )
+        if not ok or not output_path.exists():
+            continue
+        if output_path.stat().st_size <= size_limit_bytes:
+            return True
+
+    return False
+
+
 def convert_webm_to_mp4(
     input_path: Path, output_path: Path, settings: UserSettings
 ) -> bool:
@@ -455,8 +531,12 @@ def build_settings_keyboard(settings: UserSettings) -> InlineKeyboardBuilder:
     builder.button(
         text=f"Image BG: {settings.image_bg}", callback_data="set:image_bg"
     )
+    builder.button(
+        text=f"Image Output: {settings.image_output}",
+        callback_data="set:image_output",
+    )
     builder.button(text="Reset", callback_data="set:reset")
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 1, 1)
     return builder
 
 
@@ -475,6 +555,8 @@ def format_settings(settings: UserSettings) -> str:
         f"- Video Background: {settings.video_bg}\n"
         f"- Image Fit: {settings.image_fit}\n"
         f"- Image Background: {settings.image_bg}\n"
+        f"- Image Output: {settings.image_output} "
+        "(static = .png, video = .webm)\n"
         "\nTap buttons to change."
     )
 
@@ -509,12 +591,52 @@ async def process_tgs_file(
     stats.inc("tgs")
 
 
+async def process_image_as_video(
+    message: Message,
+    input_path: Path,
+    settings: UserSettings,
+    config: Config,
+) -> None:
+    if not command_exists("ffmpeg"):
+        await message.answer("Video mode not available. 👻✨")
+        return
+
+    output_webm = input_path.with_name("emoji.webm")
+    ok = convert_image_to_video_emoji(input_path, output_webm, settings)
+    if ok:
+        await send_file(
+            message,
+            output_webm,
+            "Here is your .webm video emoji made from a static image (VP9). 👻✨",
+        )
+        stats.inc("image_video_emoji")
+        return
+
+    output_png = input_path.with_name("emoji.png")
+    if PIL_AVAILABLE and convert_image_to_png_emoji(
+        input_path, output_png, settings
+    ):
+        await send_file(
+            message,
+            output_png,
+            "Could not fit a video emoji under the limits. Here is a static "
+            ".png emoji instead. 👻✨",
+        )
+        stats.inc("image")
+        return
+
+    await message.answer("Could not process the image. Try another file. 👻✨")
+
+
 async def process_image_file(
     message: Message,
     input_path: Path,
     settings: UserSettings,
     config: Config,
 ) -> None:
+    if settings.image_output == "video":
+        await process_image_as_video(message, input_path, settings, config)
+        return
     if not PIL_AVAILABLE:
         await message.answer(
             "Image mode not available. 👻✨"
@@ -727,6 +849,10 @@ async def handle_settings_callback(query: CallbackQuery) -> None:
         settings.image_fit = "crop" if settings.image_fit == "pad" else "pad"
     elif action == "image_bg":
         settings.image_bg = "transparent" if settings.image_bg == "black" else "black"
+    elif action == "image_output":
+        settings.image_output = (
+            "video" if settings.image_output == "static" else "static"
+        )
     elif action == "reset":
         user_settings[user_id] = UserSettings()
         settings = user_settings[user_id]
