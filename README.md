@@ -48,6 +48,17 @@ docker compose up --build
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
 
+### Turning static images into video emoji
+
+By default a static image (photo, `image/*` document, or static sticker) is
+returned as a `.png` static emoji. To upload images into a **video** emoji set
+instead, set `Image output` to `video` in `/settings`. The bot then renders the
+image into a looping `.webm` video emoji (VP9, 100x100, `Video duration`
+seconds long, `<=256KB`) that you can add to a video emoji pack via @Stickers.
+`Image fit` and `Image background` still control framing; `Video duration` and
+`FPS` control the clip length and frame rate. If the image cannot be fit under
+the video-emoji limits, the bot falls back to a `.png` static emoji.
+
 ## Commands
 
 - `/start` - show supported formats.
@@ -67,6 +78,7 @@ Per-user settings are available via `/settings`:
 - Video background: `black` or `transparent`
 - Image fit: `pad` or `crop`
 - Image background: `black` or `transparent`
+- Image output: `static` (100x100 `.png`) or `video` (looping `.webm` video emoji built from the image)
 
 ## Environment Variables
 
