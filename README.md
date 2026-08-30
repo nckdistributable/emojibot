@@ -214,7 +214,10 @@ The bot also sends a short congratulation when a user hits a milestone
 
 ## Settings
 
-Per-user settings are available via `/settings`:
+Per-user settings are available via `/settings`. They are saved to
+`SETTINGS_FILE` and restored on startup, so a restart does not reset anyone's
+configuration.
+
 
 - Video FPS: 24 or 30
 - Video duration: 1, 2, or 3 seconds
@@ -239,6 +242,7 @@ Per-user settings are available via `/settings`:
 - `CONCURRENCY` (default: `2`)
 - `ALLOWED_USER_IDS` (comma-separated)
 - `ADMIN_USER_IDS` (comma-separated)
+- `SETTINGS_FILE` (default: `settings.json`) - path to the JSON file where per-user settings are stored. Empty disables saving them (in-memory only).
 - `PRESETS_FILE` (default: `presets.json`) - path to the JSON file where user presets are stored. Empty disables saving them.
 - `STATS_FILE` (default: `stats.json`) - path to the JSON file where usage stats are persisted. Set to an empty value to disable persistence (in-memory only).
 
@@ -249,4 +253,5 @@ Per-user settings are available via `/settings`:
 - `ffmpeg` is required for video emoji (`.webm` VP9, 100x100, <=3s, <=30fps, <=256KB).
 - `Pillow` is required for images and static stickers. For WebP on macOS, install `webp` via Homebrew and reinstall Pillow.
 - If video emoji limits are not met, the bot returns `.mp4` or `.gif` as a fallback.
+- Per-user settings and presets are persisted next to the stats, under `SETTINGS_FILE` and `PRESETS_FILE`. Settings are flushed on a timer and only when something actually changed, so button taps do not each cause a write.
 - Usage stats (per-user request counts and aggregate counters) are persisted to `STATS_FILE` (default `stats.json`) and reloaded on startup, so they survive restarts. In Docker, mount a volume for this file to keep stats across container recreation.
