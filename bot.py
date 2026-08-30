@@ -66,6 +66,8 @@ class UserSettings:
     outline: str = "off"
     cut_bg: str = "off"
     text: str = ""
+    sheet_cols: int = 0
+    sheet_rows: int = 0
 
 
 MAX_ACTIVE_DAYS = 60
@@ -86,6 +88,14 @@ CORE_INPUT_TYPES = ("sticker", "photo", "animation", "video", "document")
 # so frames are buffered until this long passes without a new one arriving.
 ALBUM_DEBOUNCE_SECONDS = 2.0
 MAX_ALBUM_FRAMES = 10
+MAX_SHEET_SIDE = 8
+MAX_SHEET_CELLS = 36
+PACK_README = (
+    "Telegram emoji pack\n"
+    "\n"
+    "Every file here is a ready 100x100 emoji.\n"
+    "Open @Stickers in Telegram, send /newemojipack and upload the files.\n"
+)
 
 
 def parse_day(value: str) -> Optional[date]:
@@ -966,6 +976,31 @@ def format_trim(settings: UserSettings) -> str:
     return "off"
 
 
+def format_sheet(settings: UserSettings) -> str:
+    if settings.sheet_cols > 1 or settings.sheet_rows > 1:
+        return f"{settings.sheet_cols}x{settings.sheet_rows}"
+    return "off"
+
+
+def parse_sheet(raw: str) -> Optional[tuple[int, int]]:
+    """Parse '4x3', '4 3' or '4' (square) into (cols, rows)."""
+    text = raw.strip().lower().replace("x", " ").replace("*", " ")
+    parts = text.split()
+    if not parts or len(parts) > 2:
+        return None
+    try:
+        values = [int(part) for part in parts]
+    except ValueError:
+        return None
+    cols = values[0]
+    rows = values[1] if len(values) == 2 else values[0]
+    if not (1 <= cols <= MAX_SHEET_SIDE and 1 <= rows <= MAX_SHEET_SIDE):
+        return None
+    if cols * rows < 2:
+        return None
+    return cols, rows
+
+
 def parse_trim(raw: str) -> Optional[tuple[int, int]]:
     """Parse '12', '2-5' or '2 5' into (start, end). None means invalid."""
     text = raw.strip().replace("-", " ").replace(":", " ")
@@ -999,7 +1034,8 @@ def format_settings(settings: UserSettings) -> str:
         f"- Image Output: {settings.image_output} "
         "(static = .png, video = .webm)\n"
         f"- Album: {settings.album_mode} "
-        "(animate = one animated emoji, separate = one emoji per image)\n"
+        "(animate = one animated emoji, separate = one emoji per image, "
+        "zip = the whole set as an archive)\n"
         f"- Motion: {settings.motion} "
         "(normal, reverse, or boomerang)\n"
         f"- Long video: {settings.long_video} "
@@ -1010,6 +1046,7 @@ def format_settings(settings: UserSettings) -> str:
         f"- Outline: {settings.outline}\n"
         f"- Cut background: {settings.cut_bg}\n"
         f"- Text: {settings.text or 'off'} (set with /text)\n"
+        f"- Sheet: {format_sheet(settings)} (set with /sheet)\n"
         "\nTap buttons to change."
     )
 
@@ -1131,6 +1168,45 @@ async def flush_album_later(group_id: str, bot: Bot) -> None:
         )
 
 
+async def send_album_pack(
+    message: Message,
+    work_dir: Path,
+    frames: int,
+    settings: UserSettings,
+) -> None:
+    """Pack each frame as its own emoji and send the set as one archive."""
+    stats.inc("pack_in")
+    await track_request(message, "album")
+
+    members: list[tuple[Path, str]] = []
+    as_video = settings.image_output == "video" and command_exists("ffmpeg")
+    for index in range(frames):
+        frame_path = work_dir / f"frame_{index:03d}.png"
+        if as_video:
+            clip_path = work_dir / f"emoji_{index + 1:02d}.webm"
+            if convert_image_to_video_emoji(frame_path, clip_path, settings):
+                members.append((clip_path, clip_path.name))
+                continue
+        members.append((frame_path, f"emoji_{index + 1:02d}.png"))
+
+    zip_path = work_dir / "emoji_pack.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path, name in members:
+            archive.write(path, arcname=name)
+        archive.writestr("README.txt", PACK_README)
+
+    kind = "video" if as_video else "static"
+    await send_file(
+        message,
+        zip_path,
+        f"Here is your pack of {len(members)} {kind} emoji. Unzip it and "
+        "upload the files in @Stickers. 👻✨",
+        filename="emoji_pack.zip",
+        disable_content_type_detection=True,
+    )
+    stats.inc("pack_zip")
+
+
 async def process_album(buffer: AlbumBuffer, bot: Bot) -> None:
     message = buffer.message
     config = get_config()
@@ -1168,6 +1244,10 @@ async def process_album(buffer: AlbumBuffer, bot: Bot) -> None:
                 await process_image_file(
                     message, tmpdir_path / "frame_000.png", settings, config
                 )
+            return
+
+        if settings.album_mode == "zip":
+            await send_album_pack(message, tmpdir_path, frames, settings)
             return
 
         stats.inc("album_in")
@@ -1209,12 +1289,101 @@ async def process_album(buffer: AlbumBuffer, bot: Bot) -> None:
         )
 
 
+def slice_sheet(
+    input_path: Path, out_dir: Path, settings: UserSettings
+) -> int:
+    """Cut a grid image into cells and normalize each into a frame."""
+    cols = max(1, settings.sheet_cols)
+    rows = max(1, settings.sheet_rows)
+    frames = 0
+    with Image.open(input_path) as sheet:
+        sheet = sheet.convert("RGBA")
+        cell_w = sheet.width / cols
+        cell_h = sheet.height / rows
+        for row in range(rows):
+            for col in range(cols):
+                if frames >= MAX_SHEET_CELLS:
+                    break
+                box = (
+                    int(col * cell_w),
+                    int(row * cell_h),
+                    int((col + 1) * cell_w),
+                    int((row + 1) * cell_h),
+                )
+                if box[2] - box[0] < 1 or box[3] - box[1] < 1:
+                    continue
+                cell_path = out_dir / f"cell_{frames:03d}.png"
+                sheet.crop(box).save(cell_path, format="PNG")
+                frame_path = out_dir / f"frame_{frames:03d}.png"
+                if convert_image_to_png_emoji(cell_path, frame_path, settings):
+                    frames += 1
+    return frames
+
+
+async def process_sprite_sheet(
+    message: Message,
+    input_path: Path,
+    settings: UserSettings,
+    config: Config,
+) -> None:
+    if not PIL_AVAILABLE:
+        await message.answer("Image mode not available. 👻✨")
+        return
+    if not command_exists("ffmpeg"):
+        await message.answer("Video mode not available. 👻✨")
+        return
+
+    out_dir = input_path.parent
+    try:
+        frames = slice_sheet(input_path, out_dir, settings)
+    except Exception:
+        logging.getLogger("emojibot").warning(
+            "Failed to slice sheet", exc_info=True
+        )
+        frames = 0
+
+    if frames < 2:
+        await message.answer(
+            "Could not cut that sheet. Check the grid with /sheet. 👻✨"
+        )
+        return
+
+    stats.inc("sheet_in")
+    pattern = str(out_dir / "frame_%03d.png")
+    output_webm = out_dir / "sheet.webm"
+    ok = convert_frames_to_video_emoji(pattern, frames, output_webm, settings)
+    if ok:
+        await send_file(
+            message,
+            output_webm,
+            f"Here is your animated emoji from a {settings.sheet_cols}x"
+            f"{settings.sheet_rows} sheet ({frames} frames). 👻✨",
+        )
+        stats.inc("sheet_video_emoji")
+        return
+
+    output_gif = out_dir / "sheet.gif"
+    if convert_frames_to_gif(pattern, frames, output_gif, settings):
+        await send_file(
+            message,
+            output_gif,
+            "Video emoji limits were too tight. Here is a .gif instead. 👻✨",
+        )
+        stats.inc("sheet_fallback_gif")
+        return
+
+    await message.answer("Could not build an emoji from that sheet. 👻✨")
+
+
 async def process_image_file(
     message: Message,
     input_path: Path,
     settings: UserSettings,
     config: Config,
 ) -> None:
+    if settings.sheet_cols > 1 or settings.sheet_rows > 1:
+        await process_sprite_sheet(message, input_path, settings, config)
+        return
     if settings.image_output == "video":
         await process_image_as_video(message, input_path, settings, config)
         return
@@ -1511,6 +1680,35 @@ async def handle_text(message: Message, command: CommandObject) -> None:
     )
 
 
+async def handle_sheet(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+    raw = (command.args or "").strip()
+
+    if not raw or raw.lower() in {"off", "reset", "none"}:
+        settings.sheet_cols = 0
+        settings.sheet_rows = 0
+        await message.answer("Sheet slicing is off. 👻✨")
+        return
+
+    parsed = parse_sheet(raw)
+    if parsed is None:
+        await message.answer(
+            f"Use /sheet 4x3 for a grid (up to {MAX_SHEET_SIDE}x"
+            f"{MAX_SHEET_SIDE}), or /sheet off. 👻✨"
+        )
+        return
+
+    settings.sheet_cols, settings.sheet_rows = parsed
+    await message.answer(
+        f"Sheet set to {format_sheet(settings)}. Send the sheet image and I "
+        "will animate its cells. 👻✨"
+    )
+
+
 async def handle_stats(message: Message) -> None:
     config = get_config()
     if not is_admin(message.from_user.id if message.from_user else None, config):
@@ -1670,9 +1868,13 @@ async def handle_settings_callback(query: CallbackQuery) -> None:
             "video" if settings.image_output == "static" else "static"
         )
     elif action == "album_mode":
-        settings.album_mode = (
-            "separate" if settings.album_mode == "animate" else "animate"
+        order = ["animate", "separate", "zip"]
+        index = (
+            order.index(settings.album_mode)
+            if settings.album_mode in order
+            else 0
         )
+        settings.album_mode = order[(index + 1) % len(order)]
     elif action == "motion":
         order = ["normal", "reverse", "boomerang"]
         index = order.index(settings.motion) if settings.motion in order else 0
@@ -1787,8 +1989,8 @@ async def handle_photo(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
 
-    if message.media_group_id and settings.album_mode == "animate":
-        # Part of an album: collect the frames and animate them together.
+    if message.media_group_id and settings.album_mode in ("animate", "zip"):
+        # Part of an album: collect the frames and handle them together.
         await buffer_album_photo(message, bot, photo.file_id)
         return
 
@@ -1931,6 +2133,7 @@ async def main() -> None:
     dp.message.register(handle_settings, Command("settings"))
     dp.message.register(handle_trim, Command("trim"))
     dp.message.register(handle_text, Command("text"))
+    dp.message.register(handle_sheet, Command("sheet"))
     dp.message.register(handle_me, Command("me"))
     dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))

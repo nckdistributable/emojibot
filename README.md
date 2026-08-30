@@ -49,6 +49,16 @@ docker compose up --build
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
 
+### Sprite sheets and whole packs
+
+- **`/sheet 4x3`** cuts one grid image into cells (row by row) and animates
+  them into a single emoji — handy for sprite sheets exported from an
+  animation tool. Up to 8x8, 36 cells. `/sheet off` disables it.
+- **`Album: zip`** (`/settings`) turns an album into a finished set: every
+  photo becomes its own emoji and they all come back as one `emoji_pack.zip`
+  with a short README inside. The archive holds `.png` emoji, or `.webm`
+  video emoji when `Image output` is `video`.
+
 ### Image effects
 
 Applied to images, static stickers and photo-series frames:
@@ -107,6 +117,7 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 - `/settings` - adjust fit, background, FPS, duration, motion, and album handling.
 - `/trim` - pick which part of a clip to use (`/trim 2-5`, `/trim 2`, `/trim off`).
 - `/text` - draw a caption on the emoji (`/text BOO!`, `/text off`).
+- `/sheet` - slice a grid image into animation frames (`/sheet 4x3`, `/sheet off`).
 - `/me` - your personal record: how many emoji you made, your rank, how long you have been using the bot, your favorite format, active days, current streak, and unlocked achievements.
 - `/top` - leaderboard of the most active users, with your own position marked.
 - `/health` - simple health check.
@@ -143,7 +154,7 @@ Per-user settings are available via `/settings`:
 - Image fit: `pad` or `crop`
 - Image background: `black` or `transparent`
 - Image output: `static` (100x100 `.png`) or `video` (looping `.webm` video emoji built from the image)
-- Album: `animate` (several photos become one animated emoji) or `separate` (one emoji per photo)
+- Album: `animate` (several photos become one animated emoji), `separate` (one emoji per photo), or `zip` (the whole set as one archive)
 - Motion: `normal`, `reverse`, or `boomerang`
 - Long video: `trim` (cut at the duration limit) or `speedup` (fit the whole clip into it)
 - Filter: `none`, `bw`, `invert`, `sepia`, or `pixel`
