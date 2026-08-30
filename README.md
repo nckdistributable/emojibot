@@ -253,5 +253,6 @@ configuration.
 - `ffmpeg` is required for video emoji (`.webm` VP9, 100x100, <=3s, <=30fps, <=256KB).
 - `Pillow` is required for images and static stickers. For WebP on macOS, install `webp` via Homebrew and reinstall Pillow.
 - If video emoji limits are not met, the bot returns `.mp4` or `.gif` as a fallback.
-- Per-user settings and presets are persisted next to the stats, under `SETTINGS_FILE` and `PRESETS_FILE`. Settings are flushed on a timer and only when something actually changed, so button taps do not each cause a write.
+- Per-user settings and presets are persisted next to the stats, under `SETTINGS_FILE` and `PRESETS_FILE`.
+- Settings and stats are flushed on a timer and only when the content actually changed, so a button tap or a conversion does not each cause a write. The trade-off is that a hard kill can lose up to ~10s of counters and setting changes; a clean stop flushes first. Presets are written immediately, since they change rarely and deliberately.
 - Usage stats (per-user request counts and aggregate counters) are persisted to `STATS_FILE` (default `stats.json`) and reloaded on startup, so they survive restarts. In Docker, mount a volume for this file to keep stats across container recreation.
