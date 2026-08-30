@@ -57,6 +57,7 @@ class UserSettings:
     image_fit: str = "pad"
     image_bg: str = "black"
     image_output: str = "static"
+    album_mode: str = "animate"
 
 
 MAX_ACTIVE_DAYS = 60
@@ -68,7 +69,15 @@ TYPE_LABELS = {
     "animation": "GIFs",
     "video": "videos",
     "document": "files",
+    "album": "photo series",
 }
+# Formats that count toward the "tried every format" achievement. Albums are
+# deliberately excluded so the badge keeps the meaning it had when it shipped.
+CORE_INPUT_TYPES = ("sticker", "photo", "animation", "video", "document")
+# Telegram delivers an album as separate messages sharing a media_group_id,
+# so frames are buffered until this long passes without a new one arriving.
+ALBUM_DEBOUNCE_SECONDS = 2.0
+MAX_ALBUM_FRAMES = 10
 
 
 def parse_day(value: str) -> Optional[date]:
@@ -234,6 +243,7 @@ def load_stats(path: Optional[Path]) -> Stats:
 
 SUPPORTED_FORMATS_TEXT = (
     "Send: sticker, animated sticker, image, GIF, or video. "
+    "Send several photos at once and I will animate them into one emoji. "
     "I will return an emoji-ready file. 👻✨"
 )
 user_settings: dict[int, UserSettings] = {}
@@ -490,6 +500,86 @@ def convert_image_to_video_emoji(
     return False
 
 
+def convert_frames_to_video_emoji(
+    pattern: str,
+    frame_count: int,
+    output_path: Path,
+    settings: UserSettings,
+    size_limit_bytes: int = 256 * 1024,
+) -> bool:
+    if not command_exists("ffmpeg") or frame_count < 1:
+        return False
+
+    duration = max(1, min(3, settings.video_duration))
+    # Spread the frames evenly over the clip: N frames in `duration` seconds.
+    input_rate = f"{frame_count}/{duration}"
+    pix_fmt = "yuva420p" if settings.image_bg == "transparent" else "yuv420p"
+
+    attempts = [
+        {"crf": "32", "speed": "4"},
+        {"crf": "36", "speed": "4"},
+        {"crf": "40", "speed": "6"},
+    ]
+
+    for attempt in attempts:
+        ok = run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                input_rate,
+                "-i",
+                pattern,
+                "-vf",
+                f"fps={settings.video_fps}",
+                "-an",
+                "-c:v",
+                "libvpx-vp9",
+                "-pix_fmt",
+                pix_fmt,
+                "-auto-alt-ref",
+                "0",
+                "-b:v",
+                "0",
+                "-crf",
+                attempt["crf"],
+                "-speed",
+                attempt["speed"],
+                str(output_path),
+            ]
+        )
+        if not ok or not output_path.exists():
+            continue
+        if output_path.stat().st_size <= size_limit_bytes:
+            return True
+
+    return False
+
+
+def convert_frames_to_gif(
+    pattern: str,
+    frame_count: int,
+    output_path: Path,
+    settings: UserSettings,
+) -> bool:
+    if not command_exists("ffmpeg") or frame_count < 1:
+        return False
+    duration = max(1, min(3, settings.video_duration))
+    return run_cmd(
+        [
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            f"{frame_count}/{duration}",
+            "-i",
+            pattern,
+            "-loop",
+            "0",
+            str(output_path),
+        ]
+    )
+
+
 def convert_webm_to_mp4(
     input_path: Path, output_path: Path, settings: UserSettings
 ) -> bool:
@@ -597,8 +687,12 @@ def build_settings_keyboard(settings: UserSettings) -> InlineKeyboardBuilder:
         text=f"Image Output: {settings.image_output}",
         callback_data="set:image_output",
     )
+    builder.button(
+        text=f"Album: {settings.album_mode}",
+        callback_data="set:album_mode",
+    )
     builder.button(text="Reset", callback_data="set:reset")
-    builder.adjust(2, 2, 2, 1, 1)
+    builder.adjust(2, 2, 2, 1, 1, 1)
     return builder
 
 
@@ -619,6 +713,8 @@ def format_settings(settings: UserSettings) -> str:
         f"- Image Background: {settings.image_bg}\n"
         f"- Image Output: {settings.image_output} "
         "(static = .png, video = .webm)\n"
+        f"- Album: {settings.album_mode} "
+        "(animate = one animated emoji, separate = one emoji per image)\n"
         "\nTap buttons to change."
     )
 
@@ -688,6 +784,126 @@ async def process_image_as_video(
         return
 
     await message.answer("Could not process the image. Try another file. 👻✨")
+
+
+@dataclass
+class AlbumBuffer:
+    message: Message
+    file_ids: list[str] = field(default_factory=list)
+    task: Optional[asyncio.Task] = None
+
+
+album_buffers: dict[str, AlbumBuffer] = {}
+
+
+async def buffer_album_photo(message: Message, bot: Bot, file_id: str) -> None:
+    group_id = message.media_group_id or ""
+    buffer = album_buffers.get(group_id)
+    if buffer is None:
+        buffer = AlbumBuffer(message=message)
+        album_buffers[group_id] = buffer
+    if len(buffer.file_ids) < MAX_ALBUM_FRAMES:
+        buffer.file_ids.append(file_id)
+    if buffer.task is not None:
+        buffer.task.cancel()
+    buffer.task = asyncio.create_task(flush_album_later(group_id, bot))
+
+
+async def flush_album_later(group_id: str, bot: Bot) -> None:
+    try:
+        await asyncio.sleep(ALBUM_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    buffer = album_buffers.pop(group_id, None)
+    if buffer is None:
+        return
+    try:
+        await process_album(buffer, bot)
+    except Exception:
+        logging.getLogger("emojibot").warning(
+            "Failed to process album %s", group_id, exc_info=True
+        )
+        await buffer.message.answer(
+            "Could not build an emoji from those images. 👻✨"
+        )
+
+
+async def process_album(buffer: AlbumBuffer, bot: Bot) -> None:
+    message = buffer.message
+    config = get_config()
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+
+    if not PIL_AVAILABLE:
+        await message.answer("Image mode not available. 👻✨")
+        return
+    if not command_exists("ffmpeg"):
+        await message.answer("Video mode not available. 👻✨")
+        return
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        frames = 0
+        for index, file_id in enumerate(buffer.file_ids):
+            file = await bot.get_file(file_id)
+            raw_path = tmpdir_path / f"raw_{index:03d}"
+            await bot.download_file(file.file_path, destination=raw_path)
+            frame_path = tmpdir_path / f"frame_{frames:03d}.png"
+            if convert_image_to_png_emoji(raw_path, frame_path, settings):
+                frames += 1
+
+        if frames == 0:
+            await message.answer(
+                "Could not read those images. Try other files. 👻✨"
+            )
+            return
+        if frames == 1:
+            # Not really a series - fall back to the single image pipeline.
+            stats.inc("photo_in")
+            await track_request(message, "photo")
+            async with semaphore:
+                await process_image_file(
+                    message, tmpdir_path / "frame_000.png", settings, config
+                )
+            return
+
+        stats.inc("album_in")
+        await track_request(message, "album")
+
+        pattern = str(tmpdir_path / "frame_%03d.png")
+        output_webm = tmpdir_path / "emoji.webm"
+        async with semaphore:
+            ok = convert_frames_to_video_emoji(
+                pattern, frames, output_webm, settings
+            )
+        if ok:
+            await send_file(
+                message,
+                output_webm,
+                f"Here is your animated emoji from {frames} images "
+                "(VP9 .webm). 👻✨",
+            )
+            stats.inc("album_video_emoji")
+            return
+
+        output_gif = tmpdir_path / "emoji.gif"
+        async with semaphore:
+            gif_ok = convert_frames_to_gif(
+                pattern, frames, output_gif, settings
+            )
+        if gif_ok:
+            await send_file(
+                message,
+                output_gif,
+                "Video emoji limits were too tight. Here is a .gif "
+                "instead. 👻✨",
+            )
+            stats.inc("album_fallback_gif")
+            return
+
+        await message.answer(
+            "Could not build an emoji from those images. 👻✨"
+        )
 
 
 async def process_image_file(
@@ -815,6 +1031,8 @@ async def handle_help(message: Message) -> None:
         return
     text = (
         "Send a sticker, animated sticker, image, GIF, or video. 👻✨\n"
+        "Send several photos in one album and I will turn them into a single "
+        "animated emoji. 👻✨\n"
         "I will return a file you can upload to @Stickers. 👻✨\n"
         "Use /settings to tweak fit, background, FPS, and duration. 👻✨\n"
         "Use /me for your own record and /top for the leaderboard. 👻✨"
@@ -909,8 +1127,10 @@ def achievements(stat: UserStat) -> list[str]:
         earned.append("💯 Centurion - 100 emoji")
     if stat.count >= 500:
         earned.append("👑 Emoji royalty - 500 emoji")
-    if len(stat.types) >= len(TYPE_LABELS):
+    if all(stat.types.get(kind) for kind in CORE_INPUT_TYPES):
         earned.append("🎭 Versatile - tried every format")
+    if stat.types.get("album"):
+        earned.append("🎞 Animator - built an emoji from a photo series")
     if stat.night_count >= 5:
         earned.append("🦇 Night owl - 5 requests after midnight")
     streak = current_streak(stat.days)
@@ -1095,6 +1315,10 @@ async def handle_settings_callback(query: CallbackQuery) -> None:
         settings.image_output = (
             "video" if settings.image_output == "static" else "static"
         )
+    elif action == "album_mode":
+        settings.album_mode = (
+            "separate" if settings.album_mode == "animate" else "animate"
+        )
     elif action == "reset":
         user_settings[user_id] = UserSettings()
         settings = user_settings[user_id]
@@ -1182,10 +1406,16 @@ async def handle_photo(message: Message, bot: Bot) -> None:
             f"File is too large. Max {max_file_mb(config)} MB. 👻✨"
         )
         return
-    stats.inc("photo_in")
-    await track_request(message, "photo")
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
+
+    if message.media_group_id and settings.album_mode == "animate":
+        # Part of an album: collect the frames and animate them together.
+        await buffer_album_photo(message, bot, photo.file_id)
+        return
+
+    stats.inc("photo_in")
+    await track_request(message, "photo")
     file = await bot.get_file(photo.file_id)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
