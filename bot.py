@@ -14,7 +14,7 @@ import zlib
 from dataclasses import dataclass, field, fields
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urljoin, urlparse
 
 from aiogram import Bot, Dispatcher, F
@@ -198,6 +198,57 @@ def read_json_file(path: Optional[Path], label: str) -> Optional[object]:
         return None
 
 
+class JsonFlusher:
+    """Write a store to disk on a timer, and only when it actually changed.
+
+    Both stores here change far more often than they need to be durable, so
+    saving on every mutation would rewrite the whole file per button tap or
+    per request. Up to `interval` seconds of changes are lost on a hard kill.
+    """
+
+    def __init__(
+        self,
+        label: str,
+        path: Optional[Path],
+        build: "Callable[[], dict]",
+        interval: float,
+    ) -> None:
+        self.label = label
+        self.path = path
+        self.build = build
+        self.interval = interval
+        self._blob = ""
+
+    def flush(self, force: bool = False) -> bool:
+        if self.path is None:
+            return False
+        blob = dump_json(self.build())
+        if not force and blob == self._blob:
+            return False
+        if write_json_atomic(self.path, blob, self.label):
+            self._blob = blob
+            return True
+        return False
+
+    def sync(self) -> None:
+        """Adopt the current content as written, right after loading."""
+        if self.path is not None:
+            self._blob = dump_json(self.build())
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self.interval)
+                self.flush()
+            except asyncio.CancelledError:
+                self.flush()
+                raise
+            except Exception:
+                logging.getLogger("emojibot").warning(
+                    "%s flush failed", self.label, exc_info=True
+                )
+
+
 def parse_day(value: str) -> Optional[date]:
     try:
         return date.fromisoformat(value)
@@ -227,7 +278,6 @@ class Stats:
 
     def inc(self, key: str) -> None:
         self.counts[key] = self.counts.get(key, 0) + 1
-        self.save()
 
     def record_user(self, user: Optional[User], kind: str = "") -> None:
         if user is None:
@@ -257,8 +307,6 @@ class Stats:
             stat.days.append(today)
             del stat.days[:-MAX_ACTIVE_DAYS]
 
-        self.save()
-
     def to_dict(self) -> dict:
         return {
             "counts": self.counts,
@@ -278,10 +326,6 @@ class Stats:
             },
         }
 
-    def save(self) -> None:
-        if self.path is None:
-            return
-        write_json_atomic(self.path, dump_json(self.to_dict()), "stats")
 
 
 def load_stats(path: Optional[Path]) -> Stats:
@@ -1160,10 +1204,8 @@ def load_presets(path: Optional[Path]) -> None:
             user_presets[user_id] = clean_presets
 
 
-# Settings change on every button tap, so they are flushed on a timer and
-# only when the content actually differs, rather than on each mutation.
 SETTINGS_FLUSH_SECONDS = 10
-_settings_blob = ""
+STATS_FLUSH_SECONDS = 10
 
 
 def settings_path() -> Optional[Path]:
@@ -1207,49 +1249,22 @@ def settings_to_dict() -> dict:
     }
 
 
-def save_settings(path: Optional[Path], force: bool = False) -> bool:
-    global _settings_blob
-    if path is None:
-        return False
-    blob = dump_json(settings_to_dict())
-    if not force and blob == _settings_blob:
-        return False
-    if write_json_atomic(path, blob, "settings"):
-        _settings_blob = blob
-        return True
-    return False
-
-
 def load_settings(path: Optional[Path]) -> None:
-    global _settings_blob
     user_settings.clear()
     data = read_json_file(path, "settings")
-    if isinstance(data, dict):
-        users = data.get("users")
-        if isinstance(users, dict):
-            for raw_id, values in users.items():
-                try:
-                    user_id = int(raw_id)
-                except (TypeError, ValueError):
-                    continue
-                clean = sanitize_settings(values)
-                if clean:
-                    user_settings[user_id] = UserSettings(**clean)
-    _settings_blob = dump_json(settings_to_dict())
-
-
-async def settings_flusher(path: Path) -> None:
-    while True:
+    if not isinstance(data, dict):
+        return
+    users = data.get("users")
+    if not isinstance(users, dict):
+        return
+    for raw_id, values in users.items():
         try:
-            await asyncio.sleep(SETTINGS_FLUSH_SECONDS)
-            save_settings(path)
-        except asyncio.CancelledError:
-            save_settings(path)
-            raise
-        except Exception:
-            logging.getLogger("emojibot").warning(
-                "Settings flush failed", exc_info=True
-            )
+            user_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        clean = sanitize_settings(values)
+        if clean:
+            user_settings[user_id] = UserSettings(**clean)
 
 
 def get_settings(user_id: int) -> UserSettings:
@@ -3083,6 +3098,15 @@ async def main() -> None:
     if user_settings:
         logger.info("Loaded settings for %d users", len(user_settings))
 
+    flushers = [
+        JsonFlusher(
+            "settings", settings_path(), settings_to_dict, SETTINGS_FLUSH_SECONDS
+        ),
+        JsonFlusher("stats", stats_path, stats.to_dict, STATS_FLUSH_SECONDS),
+    ]
+    for flusher in flushers:
+        flusher.sync()
+
     bot = Bot(token=config.token)
     dp = Dispatcher()
 
@@ -3123,23 +3147,23 @@ async def main() -> None:
     dp.message.register(handle_unsupported)
     dp.inline_query.register(handle_inline)
 
-    flush_path = settings_path()
-    flusher: Optional[asyncio.Task] = None
-    if flush_path is not None:
-        flusher = asyncio.create_task(settings_flusher(flush_path))
+    active = [f for f in flushers if f.path is not None]
+    tasks = [asyncio.create_task(f.run()) for f in active]
 
-        async def flush_on_shutdown() -> None:
-            save_settings(flush_path)
+    async def flush_on_shutdown() -> None:
+        for flusher in active:
+            flusher.flush()
 
-        dp.shutdown.register(flush_on_shutdown)
+    dp.shutdown.register(flush_on_shutdown)
 
     try:
         await dp.start_polling(bot)
     finally:
-        if flusher is not None:
-            flusher.cancel()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
             try:
-                await flusher
+                await task
             except asyncio.CancelledError:
                 pass
 
