@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import ipaddress
 import json
 import logging
@@ -9,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -63,6 +65,7 @@ class Config:
     admin_user_ids: set[int] = field(default_factory=set)
     concurrency: int = 2
     stats_file: str = "stats.json"
+    presets_file: str = "presets.json"
 
 
 @dataclass
@@ -114,6 +117,42 @@ PACK_README = (
     "Every file here is a ready 100x100 emoji.\n"
     "Open @Stickers in Telegram, send /newemojipack and upload the files.\n"
 )
+
+
+# A preset captures style, not per-job values: caption, trim and sheet stay
+# with the job they were set for.
+PRESET_FIELDS = (
+    "video_fps",
+    "video_duration",
+    "video_fit",
+    "video_bg",
+    "image_fit",
+    "image_bg",
+    "image_output",
+    "album_mode",
+    "motion",
+    "long_video",
+    "image_filter",
+    "outline",
+    "cut_bg",
+)
+MAX_PRESETS_PER_USER = 20
+BUILTIN_PRESETS: dict[str, dict] = {
+    "sticker": {
+        "image_fit": "crop",
+        "image_bg": "transparent",
+        "outline": "white",
+        "image_output": "static",
+    },
+    "video": {
+        "image_output": "video",
+        "video_bg": "transparent",
+        "video_duration": 3,
+    },
+    "boomerang": {"motion": "boomerang", "video_duration": 2},
+    "retro": {"image_filter": "pixel", "outline": "black", "image_fit": "crop"},
+    "noir": {"image_filter": "bw", "image_fit": "crop", "image_bg": "black"},
+}
 
 
 def parse_day(value: str) -> Optional[date]:
@@ -322,6 +361,7 @@ def load_config() -> Config:
     admin_user_ids = parse_id_list(os.getenv("ADMIN_USER_IDS", ""))
     concurrency = parse_int(os.getenv("CONCURRENCY", "2"), 2)
     stats_file = os.getenv("STATS_FILE", "stats.json").strip()
+    presets_file = os.getenv("PRESETS_FILE", "presets.json").strip()
 
     return Config(
         token=token,
@@ -332,6 +372,7 @@ def load_config() -> Config:
         admin_user_ids=admin_user_ids,
         concurrency=max(1, concurrency),
         stats_file=stats_file,
+        presets_file=presets_file,
     )
 
 
@@ -995,6 +1036,122 @@ async def download_url(url: str, dest: Path, config: Config) -> Optional[str]:
             except Exception:
                 return None
     return None
+
+
+user_presets: dict[int, dict[str, dict]] = {}
+
+
+def preset_path() -> Optional[Path]:
+    config = app_config
+    if config is None or not config.presets_file:
+        return None
+    return Path(config.presets_file)
+
+
+def settings_to_preset(settings: UserSettings) -> dict:
+    return {field_name: getattr(settings, field_name) for field_name in PRESET_FIELDS}
+
+
+def sanitize_preset(data: object) -> dict:
+    """Keep only known style fields, with the type the setting expects."""
+    if not isinstance(data, dict):
+        return {}
+    defaults = UserSettings()
+    clean: dict = {}
+    for field_name in PRESET_FIELDS:
+        if field_name not in data:
+            continue
+        value = data[field_name]
+        expected = getattr(defaults, field_name)
+        if isinstance(expected, bool):
+            continue
+        if isinstance(expected, int):
+            try:
+                clean[field_name] = int(value)
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(value, str):
+            clean[field_name] = value[:32]
+    return clean
+
+
+def apply_preset(settings: UserSettings, data: dict) -> int:
+    applied = 0
+    for field_name, value in sanitize_preset(data).items():
+        setattr(settings, field_name, value)
+        applied += 1
+    return applied
+
+
+def encode_preset(data: dict) -> str:
+    raw = json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(zlib.compress(raw)).decode("ascii").rstrip("=")
+
+
+def decode_preset(code: str) -> Optional[dict]:
+    text = code.strip()
+    padding = "=" * (-len(text) % 4)
+    try:
+        raw = zlib.decompress(base64.urlsafe_b64decode(text + padding))
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    clean = sanitize_preset(data)
+    return clean or None
+
+
+def presets_to_dict() -> dict:
+    return {
+        "users": {
+            str(user_id): presets for user_id, presets in user_presets.items()
+        }
+    }
+
+
+def save_presets(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(presets_to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception:
+        logging.getLogger("emojibot").warning(
+            "Failed to persist presets to %s", path, exc_info=True
+        )
+
+
+def load_presets(path: Optional[Path]) -> None:
+    user_presets.clear()
+    if path is None or not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logging.getLogger("emojibot").warning(
+            "Failed to load presets from %s; starting fresh", path, exc_info=True
+        )
+        return
+    users = data.get("users")
+    if not isinstance(users, dict):
+        return
+    for raw_id, presets in users.items():
+        if not isinstance(presets, dict):
+            continue
+        try:
+            user_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        clean_presets = {}
+        for name, values in list(presets.items())[:MAX_PRESETS_PER_USER]:
+            clean = sanitize_preset(values)
+            if clean:
+                clean_presets[str(name)[:32]] = clean
+        if clean_presets:
+            user_presets[user_id] = clean_presets
 
 
 def get_settings(user_id: int) -> UserSettings:
@@ -2213,6 +2370,116 @@ async def handle_pack(message: Message, command: CommandObject) -> None:
     await message.answer(PACK_HELP)
 
 
+PRESET_HELP = (
+    "Save the current look and reuse it later:\n"
+    "/preset list - built-in and your own\n"
+    "/preset use <name> - apply it\n"
+    "/preset save <name> - save the current settings\n"
+    "/preset delete <name> - remove one of yours\n"
+    "/preset share <name> - get a code to pass around\n"
+    "/preset import <code> - apply someone's code\n"
+    "A preset carries the look (fit, background, filter, outline, motion, "
+    "output), not the caption, trim or sheet. 👻✨"
+)
+
+
+async def handle_preset(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+    parts = (command.args or "").strip().split(maxsplit=1)
+    action = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    own = user_presets.setdefault(user_id, {})
+
+    if action == "list" or not action:
+        lines = ["Built-in: " + ", ".join(sorted(BUILTIN_PRESETS))]
+        lines.append(
+            "Yours: " + (", ".join(sorted(own)) if own else "none yet")
+        )
+        lines.append("")
+        lines.append(PRESET_HELP)
+        await message.answer("\n".join(lines))
+        return
+
+    if action == "use":
+        name = rest.lower()[:32]
+        data = own.get(name) or BUILTIN_PRESETS.get(name)
+        if not data:
+            await message.answer(
+                f"No preset called “{name}”. Try /preset list. 👻✨"
+            )
+            return
+        applied = apply_preset(settings, data)
+        stats.inc("preset_used")
+        await message.answer(
+            f"Applied “{name}” ({applied} settings).\n"
+            f"{format_settings(settings)}",
+            reply_markup=build_settings_keyboard(settings).as_markup(),
+        )
+        return
+
+    if action == "save":
+        name = rest.lower()[:32]
+        if not name:
+            await message.answer("Name it: /preset save neon 👻✨")
+            return
+        if name in BUILTIN_PRESETS:
+            await message.answer(f"“{name}” is a built-in name. Pick another. 👻✨")
+            return
+        if len(own) >= MAX_PRESETS_PER_USER and name not in own:
+            await message.answer(
+                f"You already have {MAX_PRESETS_PER_USER} presets. "
+                "Delete one first. 👻✨"
+            )
+            return
+        own[name] = settings_to_preset(settings)
+        save_presets(preset_path())
+        stats.inc("preset_saved")
+        await message.answer(f"Saved “{name}”. Use it with /preset use {name} 👻✨")
+        return
+
+    if action == "delete":
+        name = rest.lower()[:32]
+        if name not in own:
+            await message.answer(f"You have no preset called “{name}”. 👻✨")
+            return
+        own.pop(name)
+        save_presets(preset_path())
+        await message.answer(f"Deleted “{name}”. 👻✨")
+        return
+
+    if action == "share":
+        name = rest.lower()[:32]
+        data = own.get(name) or BUILTIN_PRESETS.get(name)
+        if not data:
+            await message.answer(f"No preset called “{name}”. 👻✨")
+            return
+        await message.answer(
+            f"Code for “{name}”:\n{encode_preset(data)}\n"
+            "Anyone can apply it with /preset import <code> 👻✨"
+        )
+        return
+
+    if action == "import":
+        data = decode_preset(rest)
+        if data is None:
+            await message.answer("That code is not readable. 👻✨")
+            return
+        applied = apply_preset(settings, data)
+        stats.inc("preset_imported")
+        await message.answer(
+            f"Imported {applied} settings.\n{format_settings(settings)}\n"
+            "Save it with /preset save <name>.",
+            reply_markup=build_settings_keyboard(settings).as_markup(),
+        )
+        return
+
+    await message.answer(PRESET_HELP)
+
+
 async def handle_stats(message: Message) -> None:
     config = get_config()
     if not is_admin(message.from_user.id if message.from_user else None, config):
@@ -2710,6 +2977,10 @@ async def main() -> None:
     if stats_path is not None:
         logger.info("Stats persistence enabled at %s", stats_path)
 
+    load_presets(preset_path())
+    if user_presets:
+        logger.info("Loaded presets for %d users", len(user_presets))
+
     bot = Bot(token=config.token)
     dp = Dispatcher()
 
@@ -2728,6 +2999,7 @@ async def main() -> None:
     dp.message.register(handle_text, Command("text"))
     dp.message.register(handle_sheet, Command("sheet"))
     dp.message.register(handle_pack, Command("pack"))
+    dp.message.register(handle_preset, Command("preset"))
     dp.message.register(handle_me, Command("me"))
     dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))
