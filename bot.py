@@ -1082,6 +1082,119 @@ def build_settings_keyboard(settings: UserSettings) -> InlineKeyboardBuilder:
     return builder
 
 
+def build_result_keyboard(
+    settings: UserSettings, kind: str
+) -> InlineKeyboardBuilder:
+    """Quick tweaks that re-render the same source, no re-upload needed."""
+    builder = InlineKeyboardBuilder()
+    if kind == "video":
+        builder.button(text=f"BG: {settings.video_bg}", callback_data="edit:bg")
+        builder.button(text=f"Fit: {settings.video_fit}", callback_data="edit:fit")
+        builder.button(
+            text=f"Motion: {settings.motion}", callback_data="edit:motion"
+        )
+    else:
+        builder.button(text=f"BG: {settings.image_bg}", callback_data="edit:bg")
+        builder.button(text=f"Fit: {settings.image_fit}", callback_data="edit:fit")
+        builder.button(
+            text=f"Output: {settings.image_output}", callback_data="edit:output"
+        )
+    builder.button(
+        text=f"Filter: {settings.image_filter}", callback_data="edit:filter"
+    )
+    builder.button(text="Outline", callback_data="edit:outline")
+    builder.button(text="🔁 Again", callback_data="edit:again")
+    builder.button(text="Open @Stickers", url="https://t.me/stickers")
+    builder.adjust(3, 2, 1, 1)
+    return builder
+
+
+class EditMessage:
+    """Reply into the chat while keeping the real user as the author."""
+
+    def __init__(self, message: Message, user: User) -> None:
+        self._message = message
+        self.from_user = user
+        self.bot = getattr(message, "bot", None)
+
+    async def answer(self, *args, **kwargs):
+        return await self._message.answer(*args, **kwargs)
+
+    async def answer_document(self, *args, **kwargs):
+        return await self._message.answer_document(*args, **kwargs)
+
+
+async def handle_edit_callback(query: CallbackQuery) -> None:
+    config = get_config()
+    user_id = query.from_user.id if query.from_user else 0
+    if not is_allowed(user_id, config):
+        await query.answer("Access denied. 👻✨", show_alert=True)
+        return
+
+    session = edit_sessions.get(user_id)
+    if session is None or not session.source.exists():
+        await query.answer(
+            "That file is gone. Send it again. 👻✨", show_alert=True
+        )
+        return
+
+    settings = get_settings(user_id)
+    action = (query.data or "").split(":", 1)[-1]
+    video = session.kind == "video"
+
+    if action == "bg":
+        if video:
+            settings.video_bg = (
+                "transparent" if settings.video_bg == "black" else "black"
+            )
+        else:
+            settings.image_bg = (
+                "transparent" if settings.image_bg == "black" else "black"
+            )
+    elif action == "fit":
+        if video:
+            settings.video_fit = "crop" if settings.video_fit == "pad" else "pad"
+        else:
+            settings.image_fit = "crop" if settings.image_fit == "pad" else "pad"
+    elif action == "motion":
+        order = ["normal", "reverse", "boomerang"]
+        index = order.index(settings.motion) if settings.motion in order else 0
+        settings.motion = order[(index + 1) % len(order)]
+    elif action == "output":
+        settings.image_output = (
+            "video" if settings.image_output == "static" else "static"
+        )
+    elif action == "filter":
+        index = (
+            IMAGE_FILTERS.index(settings.image_filter)
+            if settings.image_filter in IMAGE_FILTERS
+            else 0
+        )
+        settings.image_filter = IMAGE_FILTERS[(index + 1) % len(IMAGE_FILTERS)]
+    elif action == "outline":
+        index = (
+            OUTLINE_MODES.index(settings.outline)
+            if settings.outline in OUTLINE_MODES
+            else 0
+        )
+        settings.outline = OUTLINE_MODES[(index + 1) % len(OUTLINE_MODES)]
+    elif action != "again":
+        await query.answer()
+        return
+
+    await query.answer("Re-rendering... 👻✨")
+    stats.inc("edit_rerender")
+    proxy = EditMessage(query.message, query.from_user)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        working = Path(tmpdir) / f"source{session.source.suffix}"
+        shutil.copyfile(session.source, working)
+        async with semaphore:
+            if video:
+                await process_video_file(proxy, working, settings, config)
+            else:
+                await process_image_file(proxy, working, settings, config)
+
+
 def build_help_keyboard() -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.button(text="Open @Stickers", url="https://t.me/stickers")
@@ -1502,6 +1615,7 @@ async def process_image_file(
     settings: UserSettings,
     config: Config,
 ) -> None:
+    remember_source(message, input_path, "image")
     if settings.sheet_cols > 1 or settings.sheet_rows > 1:
         await process_sprite_sheet(message, input_path, settings, config)
         return
@@ -1539,6 +1653,7 @@ async def process_video_file(
         )
         return
 
+    remember_source(message, input_path, "video")
     output_webm = input_path.with_name("emoji.webm")
     output_mp4 = input_path.with_name("fallback.mp4")
     output_gif = input_path.with_name("fallback.gif")
@@ -1580,6 +1695,53 @@ async def process_video_file(
         return
 
     await message.answer("Could not process the video. Try another file. 👻✨")
+
+EDIT_SESSION_TTL_SECONDS = 30 * 60
+
+
+@dataclass
+class EditSession:
+    source: Path
+    kind: str
+    created: float
+
+
+edit_sessions: dict[int, EditSession] = {}
+
+
+def edit_session_root() -> Path:
+    return Path(tempfile.gettempdir()) / "emojibot_edit"
+
+
+def prune_edit_sessions() -> None:
+    cutoff = time.time() - EDIT_SESSION_TTL_SECONDS
+    for user_id, session in list(edit_sessions.items()):
+        if session.created < cutoff:
+            edit_sessions.pop(user_id, None)
+            shutil.rmtree(session.source.parent, ignore_errors=True)
+
+
+def remember_source(message: Message, source: Path, kind: str) -> None:
+    """Keep a copy of the input so it can be re-rendered from a button."""
+    user = message.from_user
+    if user is None:
+        return
+    prune_edit_sessions()
+    try:
+        target_dir = edit_session_root() / str(user.id)
+        shutil.rmtree(target_dir, ignore_errors=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"source{source.suffix}"
+        shutil.copyfile(source, target)
+    except Exception:
+        logging.getLogger("emojibot").warning(
+            "Could not keep the source for %s", user.id, exc_info=True
+        )
+        return
+    edit_sessions[user.id] = EditSession(
+        source=target, kind=kind, created=time.time()
+    )
+
 
 DEFAULT_PACK_EMOJI = "👻"
 STICKER_FORMATS = {
@@ -1710,7 +1872,16 @@ async def send_file(
     disable_content_type_detection: bool = False,
     pack_path: Optional[Path] = None,
 ) -> None:
-    keyboard = build_help_keyboard().as_markup() if include_help else None
+    keyboard = None
+    if include_help:
+        user = message.from_user
+        session = edit_sessions.get(user.id) if user else None
+        if session is not None:
+            keyboard = build_result_keyboard(
+                get_settings(user.id), session.kind
+            ).as_markup()
+        else:
+            keyboard = build_help_keyboard().as_markup()
     sent = await message.answer_document(
         FSInputFile(str(path), filename=filename),
         caption=caption,
@@ -2564,6 +2735,9 @@ async def main() -> None:
     dp.message.register(handle_health, Command("health"))
     dp.callback_query.register(
         handle_settings_callback, F.data.startswith("set:")
+    )
+    dp.callback_query.register(
+        handle_edit_callback, F.data.startswith("edit:")
     )
     dp.message.register(handle_sticker, F.sticker)
     dp.message.register(handle_photo, F.photo)

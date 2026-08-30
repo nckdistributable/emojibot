@@ -50,6 +50,16 @@ docker compose up --build
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
 
+### Tweaking the result without re-uploading
+
+Every converted file comes back with buttons under it — background, fit,
+output, filter, outline, and 🔁 Again. Pressing one re-renders **the same
+source** with the new setting, so you can dial an emoji in without sending
+the file again. Video sources get a motion button instead of output.
+
+The source is kept for 30 minutes and then discarded; after that the bot
+asks for the file again.
+
 ### Building a real emoji pack
 
 The bot can assemble the pack itself, so you never have to visit @Stickers:
