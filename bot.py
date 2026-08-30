@@ -21,6 +21,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineQuery,
     InlineQueryResultCachedDocument,
+    InputSticker,
     Message,
     User,
 )
@@ -285,6 +286,7 @@ user_settings: dict[int, UserSettings] = {}
 stats = Stats(start_time=time.monotonic())
 semaphore: Optional[asyncio.Semaphore] = None
 app_config: Optional[Config] = None
+bot_username: str = ""
 
 
 def parse_int(value: str, default: int) -> int:
@@ -1195,6 +1197,7 @@ async def process_tgs_file(
         f"{caption} Sent as .zip so Telegram keeps it as a downloadable file. You need to download this file and unpack it to get the .tgs file. 👻✨",
         filename="emoji.tgs.zip",
         disable_content_type_detection=True,
+        pack_path=output_path,
     )
     stats.inc("tgs")
 
@@ -1578,6 +1581,90 @@ async def process_video_file(
 
     await message.answer("Could not process the video. Try another file. 👻✨")
 
+DEFAULT_PACK_EMOJI = "👻"
+STICKER_FORMATS = {
+    ".png": "static",
+    ".webp": "static",
+    ".webm": "video",
+    ".tgs": "animated",
+}
+
+
+@dataclass
+class PackSession:
+    title: str
+    name: str = ""
+    count: int = 0
+    emoji: str = DEFAULT_PACK_EMOJI
+
+
+pack_sessions: dict[int, PackSession] = {}
+
+
+def build_pack_name(user_id: int) -> str:
+    """Telegram requires the set name to end with _by_<bot username>."""
+    return f"e{user_id}_{int(time.time())}_by_{bot_username}"
+
+
+def pack_link(name: str) -> str:
+    return f"https://t.me/addemoji/{name}"
+
+
+async def add_to_pack(message: Message, path: Path) -> None:
+    """Append a produced emoji to the user's open pack, if there is one."""
+    user = message.from_user
+    if user is None:
+        return
+    session = pack_sessions.get(user.id)
+    if session is None:
+        return
+    sticker_format = STICKER_FORMATS.get(path.suffix.lower())
+    if sticker_format is None:
+        return
+    bot = getattr(message, "bot", None)
+    if bot is None or not bot_username:
+        return
+
+    try:
+        uploaded = await bot.upload_sticker_file(
+            user_id=user.id,
+            sticker=FSInputFile(str(path)),
+            sticker_format=sticker_format,
+        )
+        sticker = InputSticker(
+            sticker=uploaded.file_id,
+            format=sticker_format,
+            emoji_list=[session.emoji],
+        )
+        if not session.name:
+            name = build_pack_name(user.id)
+            await bot.create_new_sticker_set(
+                user_id=user.id,
+                name=name,
+                title=session.title,
+                stickers=[sticker],
+                sticker_type="custom_emoji",
+            )
+            session.name = name
+        else:
+            await bot.add_sticker_to_set(
+                user_id=user.id, name=session.name, sticker=sticker
+            )
+    except Exception as error:
+        logging.getLogger("emojibot").warning(
+            "Failed to add to pack for %s", user.id, exc_info=True
+        )
+        await message.answer(f"Could not add that to the pack: {error} 👻✨")
+        return
+
+    session.count += 1
+    stats.inc("pack_sticker_added")
+    await message.answer(
+        f"Added to “{session.title}” ({session.count}). {pack_link(session.name)}\n"
+        "Send more, or /pack finish when you are done. 👻✨"
+    )
+
+
 MAX_RECENT_FILES = 10
 # Per-user file_ids of emoji the bot produced, newest first, for inline reuse.
 recent_files: dict[int, list[tuple[str, str]]] = {}
@@ -1621,6 +1708,7 @@ async def send_file(
     include_help: bool = True,
     filename: Optional[str] = None,
     disable_content_type_detection: bool = False,
+    pack_path: Optional[Path] = None,
 ) -> None:
     keyboard = build_help_keyboard().as_markup() if include_help else None
     sent = await message.answer_document(
@@ -1630,6 +1718,7 @@ async def send_file(
         disable_content_type_detection=disable_content_type_detection,
     )
     remember_file(message.from_user, sent, filename or path.name)
+    await add_to_pack(message, pack_path or path)
 
 
 async def reject_if_not_allowed(message: Message, config: Config) -> bool:
@@ -1660,6 +1749,7 @@ async def handle_help(message: Message) -> None:
         "Send a sticker, animated sticker, image, GIF, or video. 👻✨\n"
         "Send several photos in one album and I will turn them into a single "
         "animated emoji. 👻✨\n"
+        "Use /pack new <title> and I will build a real emoji pack for you. 👻✨\n"
         "I will return a file you can upload to @Stickers. 👻✨\n"
         "Use /settings to tweak fit, background, FPS, and duration. 👻✨\n"
         "Use /me for your own record and /top for the leaderboard. 👻✨"
@@ -1862,6 +1952,94 @@ async def handle_sheet(message: Message, command: CommandObject) -> None:
         f"Sheet set to {format_sheet(settings)}. Send the sheet image and I "
         "will animate its cells. 👻✨"
     )
+
+
+PACK_HELP = (
+    "Build a real emoji pack:\n"
+    "/pack new <title> - start a pack\n"
+    "/pack emoji 🔥 - emoji shown for the next additions\n"
+    "/pack status - what is in it\n"
+    "/pack finish - close it and get the link\n"
+    "/pack cancel - stop adding (the pack stays)\n"
+    "While a pack is open, everything you convert is added to it. 👻✨"
+)
+
+
+async def handle_pack(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    raw = (command.args or "").strip()
+    parts = raw.split(maxsplit=1)
+    action = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    session = pack_sessions.get(user_id)
+
+    if action in ("new", "start"):
+        if not bot_username:
+            await message.answer("Pack mode is not ready yet. Try again. 👻✨")
+            return
+        title = rest[:64] or "My emoji"
+        pack_sessions[user_id] = PackSession(title=title)
+        stats.inc("pack_started")
+        await message.answer(
+            f"Started pack “{title}”. Send me anything and I will add it. "
+            "Use /pack finish when done. 👻✨"
+        )
+        return
+
+    if action == "emoji":
+        if session is None:
+            await message.answer("No open pack. Start one with /pack new. 👻✨")
+            return
+        if not rest:
+            await message.answer("Send it like /pack emoji 🔥 👻✨")
+            return
+        session.emoji = rest[:20]
+        await message.answer(f"New emoji will be tagged {session.emoji} 👻✨")
+        return
+
+    if action in ("finish", "done", "close"):
+        if session is None:
+            await message.answer("No open pack. Start one with /pack new. 👻✨")
+            return
+        pack_sessions.pop(user_id, None)
+        if not session.name:
+            await message.answer(
+                f"Pack “{session.title}” was closed, but nothing was added. 👻✨"
+            )
+            return
+        stats.inc("pack_finished")
+        await message.answer(
+            f"“{session.title}” is ready with {session.count} emoji.\n"
+            f"{pack_link(session.name)} 👻✨"
+        )
+        return
+
+    if action in ("cancel", "stop"):
+        if session is None:
+            await message.answer("No open pack. 👻✨")
+            return
+        pack_sessions.pop(user_id, None)
+        note = f"\nIt keeps what was added: {pack_link(session.name)}" if session.name else ""
+        await message.answer(f"Stopped adding to “{session.title}”.{note} 👻✨")
+        return
+
+    if action == "status" or not action:
+        if session is None:
+            await message.answer(PACK_HELP)
+            return
+        link = pack_link(session.name) if session.name else "not created yet"
+        await message.answer(
+            f"Open pack: “{session.title}”\n"
+            f"Emoji added: {session.count}\n"
+            f"Tagged with: {session.emoji}\n"
+            f"Link: {link} 👻✨"
+        )
+        return
+
+    await message.answer(PACK_HELP)
 
 
 async def handle_stats(message: Message) -> None:
@@ -2364,12 +2542,21 @@ async def main() -> None:
     bot = Bot(token=config.token)
     dp = Dispatcher()
 
+    global bot_username
+    try:
+        me = await bot.me()
+        bot_username = me.username or ""
+        logger.info("Running as @%s", bot_username)
+    except Exception:
+        logger.warning("Could not resolve the bot username", exc_info=True)
+
     dp.message.register(handle_start, CommandStart())
     dp.message.register(handle_help, Command("help"))
     dp.message.register(handle_settings, Command("settings"))
     dp.message.register(handle_trim, Command("trim"))
     dp.message.register(handle_text, Command("text"))
     dp.message.register(handle_sheet, Command("sheet"))
+    dp.message.register(handle_pack, Command("pack"))
     dp.message.register(handle_me, Command("me"))
     dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))
