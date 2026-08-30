@@ -49,6 +49,20 @@ docker compose up --build
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
 
+### Image effects
+
+Applied to images, static stickers and photo-series frames:
+
+- **Filter** (`/settings`): `none`, `bw`, `invert`, `sepia`, `pixel`. Videos and
+  GIFs get the same look through the matching ffmpeg filters.
+- **Outline** (`/settings`): `white` or `black` ring around the visible pixels,
+  so the emoji stays readable on any chat background.
+- **Cut BG** (`/settings`): clears the background by flood-filling from the
+  corners. Works on solid or near-solid backgrounds; it is a color match, not
+  a cutout model.
+- **`/text BOO!`** draws a caption at the bottom (white with a black stroke,
+  auto-shrunk to fit). `/text off` clears it.
+
 ### Motion, speed and trimming
 
 Video, GIF and photo-series emoji can be reshaped before encoding:
@@ -92,6 +106,7 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 - `/help` - short usage info and a link to @Stickers.
 - `/settings` - adjust fit, background, FPS, duration, motion, and album handling.
 - `/trim` - pick which part of a clip to use (`/trim 2-5`, `/trim 2`, `/trim off`).
+- `/text` - draw a caption on the emoji (`/text BOO!`, `/text off`).
 - `/me` - your personal record: how many emoji you made, your rank, how long you have been using the bot, your favorite format, active days, current streak, and unlocked achievements.
 - `/top` - leaderboard of the most active users, with your own position marked.
 - `/health` - simple health check.
@@ -131,6 +146,9 @@ Per-user settings are available via `/settings`:
 - Album: `animate` (several photos become one animated emoji) or `separate` (one emoji per photo)
 - Motion: `normal`, `reverse`, or `boomerang`
 - Long video: `trim` (cut at the duration limit) or `speedup` (fit the whole clip into it)
+- Filter: `none`, `bw`, `invert`, `sepia`, or `pixel`
+- Outline: `off`, `white`, or `black`
+- Cut BG: `off` or `on` (flood-fill the background away from the corners)
 
 ## Environment Variables
 
