@@ -39,6 +39,7 @@ docker compose up --build
    - animated sticker (`.tgs`)
    - video sticker (`.webm`)
    - image (photo or `image/*` document)
+   - several photos in one album (animated into a single emoji)
    - GIF (as a file or animation)
    - video (as a file or video message)
 2. The bot returns a ready file:
@@ -47,6 +48,18 @@ docker compose up --build
    - `.png` 100x100 for static emoji
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
+
+### Animating a series of photos into one emoji
+
+Send several photos **as one album** and the bot stitches them into a single
+animated emoji instead of returning one file per photo: every frame is
+normalized to 100x100 (using `Image fit` / `Image background`) and the frames
+are spread evenly over `Video duration` seconds, encoded as a looping VP9
+`.webm` (`<=256KB`), with a `.gif` fallback if the limits cannot be met.
+Up to 10 frames are used — the size of one Telegram album.
+
+Set `Album` to `separate` in `/settings` to get the old behaviour back (one
+emoji per photo).
 
 ### Turning static images into video emoji
 
@@ -81,6 +94,7 @@ Every user collects badges automatically, visible in `/me`:
 | 💯 Centurion | 100 emoji |
 | 👑 Emoji royalty | 500 emoji |
 | 🎭 Versatile | using every input format (sticker, photo, GIF, video, file) |
+| 🎞 Animator | building an emoji from a photo series |
 | 🦇 Night owl | 5 requests after midnight (server time) |
 | 🔥 On fire | 3+ days in a row |
 | 🧙 Veteran | a month since the first request |
@@ -99,6 +113,7 @@ Per-user settings are available via `/settings`:
 - Image fit: `pad` or `crop`
 - Image background: `black` or `transparent`
 - Image output: `static` (100x100 `.png`) or `video` (looping `.webm` video emoji built from the image)
+- Album: `animate` (several photos become one animated emoji) or `separate` (one emoji per photo)
 
 ## Environment Variables
 
