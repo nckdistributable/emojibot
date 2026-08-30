@@ -245,10 +245,22 @@ seconds long, `<=256KB`) that you can add to a video emoji pack via @Stickers.
 `FPS` control the clip length and frame rate. If the image cannot be fit under
 the video-emoji limits, the bot falls back to a `.png` static emoji.
 
+## Language
+
+The bot speaks English and Russian. It picks one from the Telegram client's
+locale the first time it sees someone, and `/lang ru` or `/lang en` changes
+it. The choice is stored with the rest of the settings, so it survives a
+restart. The command list shown in the client is published in both
+languages.
+
+Admin output (`/stats`, `/users`, `/sources`) stays in English — it is for
+whoever runs the bot, not for its users.
+
 ## Commands
 
 - `/start` - show supported formats.
 - `/help` - short usage info and a link to @Stickers.
+- `/lang` - switch between English and Russian (`/lang ru`).
 - `/settings` - adjust fit, background, FPS, duration, motion, and album handling.
 - `/trim` - pick which part of a clip to use (`/trim 2-5`, `/trim 2`, `/trim off`).
 - `/text` - draw a caption on the emoji (`/text BOO!`, `/text off`).
