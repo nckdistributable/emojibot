@@ -65,8 +65,8 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 - `/help` - short usage info and a link to @Stickers.
 - `/settings` - adjust fit, background, FPS, and duration.
 - `/health` - simple health check.
-- `/stats` - usage stats, including unique user and total request counts (admin only).
-- `/users` - per-user breakdown of who sent requests and how many times, ranked by request count (admin only).
+- `/stats` - usage stats, including uptime (as `2d 7h 33m`), unique user and total request counts (admin only).
+- `/users` - per-user breakdown of who sent requests, how many times, and when they were last seen, ranked by request count (admin only).
 
 ## Settings
 
