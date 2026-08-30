@@ -251,6 +251,34 @@ class JsonFlusher:
                 )
 
 
+MAX_SOURCE_LEN = 24
+SOURCE_ALLOWED = frozenset(
+    "abcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+DEFAULT_SOURCE = "direct"
+
+
+def clean_source(raw: str) -> str:
+    lowered = raw.strip().lower()[:MAX_SOURCE_LEN]
+    return "".join(ch for ch in lowered if ch in SOURCE_ALLOWED)
+
+
+def parse_start_payload(payload: str) -> tuple[str, str]:
+    """Split a /start payload into (kind, value)."""
+    text = (payload or "").strip()
+    if not text:
+        return "", ""
+    for prefix, kind in (
+        ("src_", "source"),
+        ("ref_", "referral"),
+        ("preset_", "preset"),
+        ("g", "gallery"),
+    ):
+        if text.startswith(prefix):
+            return kind, text[len(prefix) :]
+    return "source", text
+
+
 def parse_day(value: str) -> Optional[date]:
     try:
         return date.fromisoformat(value)
@@ -269,6 +297,8 @@ class UserStat:
     night_count: int = 0
     types: dict[str, int] = field(default_factory=dict)
     days: list[str] = field(default_factory=list)
+    source: str = ""
+    invited: int = 0
 
 
 @dataclass
@@ -281,17 +311,27 @@ class Stats:
     def inc(self, key: str) -> None:
         self.counts[key] = self.counts.get(key, 0) + 1
 
-    def record_user(self, user: Optional[User], kind: str = "") -> None:
+    def touch_user(self, user: Optional[User]) -> tuple[Optional[UserStat], bool]:
+        """Get or create a user's record without counting a request."""
         if user is None:
-            return
+            return None, False
         stat = self.users.get(user.id)
+        created = stat is None
         if stat is None:
-            stat = UserStat(user_id=user.id)
+            stat = UserStat(user_id=user.id, first_seen=time.time())
             self.users[user.id] = stat
         if user.username:
             stat.username = user.username
         if user.full_name:
             stat.full_name = user.full_name
+        return stat, created
+
+    def record_user(self, user: Optional[User], kind: str = "") -> None:
+        if user is None:
+            return
+        stat, _ = self.touch_user(user)
+        if stat is None:
+            return
 
         now = time.time()
         if stat.first_seen <= 0:
@@ -323,6 +363,8 @@ class Stats:
                     "night_count": u.night_count,
                     "types": u.types,
                     "days": u.days,
+                    "source": u.source,
+                    "invited": u.invited,
                 }
                 for uid, u in self.users.items()
             },
@@ -376,6 +418,8 @@ def load_stats(path: Optional[Path]) -> Stats:
                     night_count=int(info.get("night_count", 0)),
                     types=types,
                     days=days,
+                    source=str(info.get("source", ""))[:MAX_SOURCE_LEN],
+                    invited=int(info.get("invited", 0)),
                 )
             except Exception:
                 continue
@@ -2315,11 +2359,129 @@ def get_config() -> Config:
         raise RuntimeError("Config is not initialized")
     return app_config
 
-async def handle_start(message: Message) -> None:
+def bot_link(payload: str = "") -> str:
+    base = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
+    return f"{base}?start={payload}" if payload else base
+
+
+def credit_referrer(referrer_id: int, new_user_id: int) -> None:
+    if referrer_id == new_user_id or referrer_id not in stats.users:
+        return
+    stats.users[referrer_id].invited += 1
+    stats.inc("referral_joined")
+
+
+def record_arrival(user: Optional[User], payload: str) -> bool:
+    """Attribute a first arrival to whatever brought the person here."""
+    stat, created = stats.touch_user(user)
+    if stat is None:
+        return False
+
+    kind, value = parse_start_payload(payload)
+    source = ""
+    if kind == "source":
+        source = clean_source(value)
+    elif kind == "referral":
+        source = "referral"
+    elif kind in ("preset", "gallery"):
+        source = f"shared_{kind}"
+
+    if created:
+        stat.source = source or DEFAULT_SOURCE
+        stats.inc(f"src:{stat.source}")
+        if kind == "referral":
+            try:
+                credit_referrer(int(value), stat.user_id)
+            except (TypeError, ValueError):
+                pass
+    return created
+
+
+async def handle_start(message: Message, command: CommandObject) -> None:
     config = get_config()
     if await reject_if_not_allowed(message, config):
         return
+    payload = (command.args or "").strip()
+    is_new = record_arrival(message.from_user, payload)
+
+    kind, value = parse_start_payload(payload)
+    if kind == "preset":
+        data = decode_preset(value)
+        if data:
+            user_id = message.from_user.id if message.from_user else 0
+            applied = apply_preset(get_settings(user_id), data)
+            stats.inc("preset_link_used")
+            await message.answer(
+                f"A shared look was applied ({applied} settings). "
+                "Send an image or video and see. 👻✨"
+            )
+            return
+    elif kind == "gallery":
+        try:
+            wanted = int(value)
+        except (TypeError, ValueError):
+            wanted = 0
+        for index, item in enumerate(sorted_gallery("newest")):
+            if item.item_id == wanted:
+                stats.inc("gallery_link_opened")
+                await show_gallery(message, index, "newest", edit=False)
+                return
+
     await message.answer(SUPPORTED_FORMATS_TEXT)
+    if is_new:
+        stats.inc("user_joined")
+
+
+async def handle_invite(message: Message) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    stat = stats.users.get(user_id)
+    brought = stat.invited if stat else 0
+    await message.answer(
+        "Share this link and I will know they came from you:\n"
+        f"{bot_link(f'ref_{user_id}')}\n"
+        f"People you brought so far: {brought} 👻✨"
+    )
+
+
+async def handle_sources(message: Message) -> None:
+    config = get_config()
+    if not is_admin(message.from_user.id if message.from_user else None, config):
+        return
+    if not stats.users:
+        await message.answer("Nobody has arrived yet. 👻✨")
+        return
+
+    started: dict[str, int] = {}
+    converted: dict[str, int] = {}
+    for stat in stats.users.values():
+        source = stat.source or DEFAULT_SOURCE
+        started[source] = started.get(source, 0) + 1
+        if stat.count:
+            converted[source] = converted.get(source, 0) + 1
+
+    lines = ["Source: started -> converted (rate)"]
+    for source in sorted(started, key=lambda s: started[s], reverse=True):
+        total = started[source]
+        made = converted.get(source, 0)
+        lines.append(f"{source}: {total} -> {made} ({made * 100 // total}%)")
+
+    inviters = sorted(
+        (s for s in stats.users.values() if s.invited),
+        key=lambda s: s.invited,
+        reverse=True,
+    )[:5]
+    if inviters:
+        lines.append("")
+        lines.append("Top inviters:")
+        for stat in inviters:
+            lines.append(f"{format_user_label(stat)}: {stat.invited}")
+
+    lines.append("")
+    lines.append(f"Tag a channel with {bot_link('src_yourchannel')}")
+    await message.answer("\n".join(lines))
 
 
 async def handle_help(message: Message) -> None:
@@ -2974,9 +3136,11 @@ async def handle_stats(message: Message) -> None:
         return
     uptime = time.monotonic() - stats.start_time
     total_requests = sum(u.count for u in stats.users.values())
+    converted = sum(1 for u in stats.users.values() if u.count)
     lines = [
         f"Uptime: {format_duration(uptime)}",
-        f"unique_users: {len(stats.users)}",
+        f"users_started: {len(stats.users)}",
+        f"users_converted: {converted}",
     ]
     if total_requests:
         lines.append(f"total_requests: {total_requests}")
@@ -3513,6 +3677,8 @@ async def main() -> None:
     dp.message.register(handle_make, Command("make"))
     dp.message.register(handle_publish, Command("publish"))
     dp.message.register(handle_gallery, Command("gallery"))
+    dp.message.register(handle_invite, Command("invite"))
+    dp.message.register(handle_sources, Command("sources"))
     dp.message.register(handle_me, Command("me"))
     dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))

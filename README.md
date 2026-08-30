@@ -62,6 +62,25 @@ The text is white with a black outline, on the background from `Image
 background`, and each tile respects `Image output`, so `video` gives you
 `.webm` tiles. With a pack open the tiles are added to it in order.
 
+### Knowing where people came from
+
+`/start` accepts a payload, so a link can carry its origin:
+
+```
+t.me/yourbot?start=src_reddit      tag a channel you posted in
+t.me/yourbot?start=ref_<user id>   a personal invite link, from /invite
+```
+
+The source is recorded once, on a person's first arrival, and never
+overwritten, so it stays a first-touch attribution. `/sources` (admin) shows
+how many people each channel brought and how many of them actually made an
+emoji — the conversion rate is the point, since a channel that brings
+visitors who never convert is not working. `/stats` splits `users_started`
+from `users_converted` for the same reason.
+
+`/invite` gives a person their own link and tells them how many people they
+brought.
+
 ### Gallery
 
 Emoji can be shared with everyone using the bot:
@@ -218,11 +237,13 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 - `/preset` - save and reuse a look (`/preset use retro`, `/preset save neon`, `/preset share neon`).
 - `/make` - draw text as emoji, split into banner tiles if long (`/make BOO`).
 - `/publish` - publish the emoji you just made to the gallery (`/publish remove <id>` takes it down).
+- `/invite` - your personal invite link and how many people you brought.
 - `/gallery` - browse published emoji (`/gallery top`, `/gallery mine`, admin `/gallery remove <id>`).
 - `/me` - your personal record: how many emoji you made, your rank, how long you have been using the bot, your favorite format, active days, current streak, and unlocked achievements.
 - `/top` - leaderboard of the most active users, with your own position marked.
 - `/health` - simple health check.
 - `/stats` - usage stats, including uptime (as `2d 7h 33m`), unique user and total request counts (admin only).
+- `/sources` - where users came from and how many converted (admin only).
 - `/users` - per-user breakdown of who sent requests, how many times, and when they were last seen, ranked by request count (admin only).
 
 ## Achievements
