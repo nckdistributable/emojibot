@@ -62,6 +62,17 @@ The text is white with a black outline, on the background from `Image
 background`, and each tile respects `Image output`, so `video` gives you
 `.webm` tiles. With a pack open the tiles are added to it in order.
 
+### Spreading through chats
+
+Telegram has no real bot directory, so the bot travels through chats. Two
+things carry it:
+
+- Every file the bot sends has a **✨ Make yours** button pointing back at the
+  bot, tagged as `src_shared`. URL buttons survive forwarding, so the button
+  goes wherever the file goes.
+- Preset and gallery links (above) bring people in with the look already
+  applied or the entry already open, and both are attributed on arrival.
+
 ### Knowing where people came from
 
 `/start` accepts a payload, so a link can carry its origin:
@@ -93,6 +104,9 @@ Emoji can be shared with everyone using the bot:
 /publish remove <id>   take one of yours down
 ```
 
+Every entry shows its own `t.me/...?start=g<id>` link, which opens the bot
+straight on that entry.
+
 Browsing is one message with ◀ ▶ to move, 👍 to like (one per person, press
 again to undo), and ⬇ Get to have the file sent to you. Publishing is
 explicit and attributes your username; up to 20 entries per person. Admins
@@ -117,6 +131,12 @@ A preset carries the **look** — fit, background, filter, outline, motion,
 output, fps, duration — and deliberately not the caption, trim or sheet
 grid, which belong to the job you set them for. Imported codes are filtered
 down to known style fields, so a code can only change the look.
+
+`/preset share` gives a link that applies the look the moment someone opens
+it, plus the raw code for `/preset import`. A `/start` payload is capped at
+64 characters and an encoded preset is far longer, so the link carries a
+short token and the bot holds the values; the same preset always maps to the
+same token.
 
 Presets are saved to `PRESETS_FILE` and survive restarts.
 

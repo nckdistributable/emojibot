@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import ipaddress
 import json
 import logging
@@ -1200,6 +1201,8 @@ async def download_url(url: str, dest: Path, config: Config) -> Optional[str]:
 
 
 user_presets: dict[int, dict[str, dict]] = {}
+shared_presets: dict[str, dict] = {}
+MAX_SHARED_PRESETS = 500
 
 
 def preset_path() -> Optional[Path]:
@@ -1261,11 +1264,30 @@ def decode_preset(code: str) -> Optional[dict]:
     return clean or None
 
 
+def share_preset(data: dict) -> str:
+    """Register a preset under a short token usable in a deep link.
+
+    A /start payload is capped at 64 characters and the encoded preset is far
+    longer, so the link carries a token and the bot holds the values.
+    """
+    clean = sanitize_preset(data)
+    if not clean:
+        return ""
+    blob = json.dumps(clean, separators=(",", ":"), sort_keys=True)
+    token = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:10]
+    if token not in shared_presets:
+        shared_presets[token] = clean
+        while len(shared_presets) > MAX_SHARED_PRESETS:
+            shared_presets.pop(next(iter(shared_presets)))
+    return token
+
+
 def presets_to_dict() -> dict:
     return {
         "users": {
             str(user_id): presets for user_id, presets in user_presets.items()
-        }
+        },
+        "shared": shared_presets,
     }
 
 
@@ -1277,9 +1299,16 @@ def save_presets(path: Optional[Path]) -> None:
 
 def load_presets(path: Optional[Path]) -> None:
     user_presets.clear()
+    shared_presets.clear()
     data = read_json_file(path, "presets")
     if not isinstance(data, dict):
         return
+    shared = data.get("shared")
+    if isinstance(shared, dict):
+        for token, values in list(shared.items())[:MAX_SHARED_PRESETS]:
+            clean = sanitize_preset(values)
+            if clean and isinstance(token, str):
+                shared_presets[token[:32]] = clean
     users = data.get("users")
     if not isinstance(users, dict):
         return
@@ -1470,7 +1499,8 @@ def build_result_keyboard(
     builder.button(text="Outline", callback_data="edit:outline")
     builder.button(text="🔁 Again", callback_data="edit:again")
     builder.button(text="Open @Stickers", url="https://t.me/stickers")
-    builder.adjust(3, 2, 1, 1)
+    add_attribution_button(builder)
+    builder.adjust(3, 2, 1, 1, 1)
     return builder
 
 
@@ -1563,7 +1593,14 @@ async def handle_edit_callback(query: CallbackQuery) -> None:
 def build_help_keyboard() -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.button(text="Open @Stickers", url="https://t.me/stickers")
+    add_attribution_button(builder)
     return builder
+
+
+def add_attribution_button(builder: InlineKeyboardBuilder) -> None:
+    """A forwarded file keeps its URL buttons, so this travels with it."""
+    if bot_username:
+        builder.button(text="✨ Make yours", url=bot_link("src_shared"))
 
 
 def format_trim(settings: UserSettings) -> str:
@@ -2406,7 +2443,7 @@ async def handle_start(message: Message, command: CommandObject) -> None:
 
     kind, value = parse_start_payload(payload)
     if kind == "preset":
-        data = decode_preset(value)
+        data = shared_presets.get(value) or decode_preset(value)
         if data:
             user_id = message.from_user.id if message.from_user else 0
             applied = apply_preset(get_settings(user_id), data)
@@ -2872,10 +2909,16 @@ async def handle_preset(message: Message, command: CommandObject) -> None:
         if not data:
             await message.answer(f"No preset called “{name}”. 👻✨")
             return
-        await message.answer(
-            f"Code for “{name}”:\n{encode_preset(data)}\n"
-            "Anyone can apply it with /preset import <code> 👻✨"
-        )
+        token = share_preset(data)
+        save_presets(preset_path())
+        stats.inc("preset_shared")
+        lines = [f"Share “{name}”:"]
+        if token:
+            lines.append(bot_link(f"preset_{token}"))
+            lines.append("Opening that link applies the look right away.")
+        lines.append("")
+        lines.append(f"Or paste this code: {encode_preset(data)}")
+        await message.answer("\n".join(lines) + " 👻✨")
         return
 
     if action == "import":
@@ -2963,6 +3006,7 @@ def format_gallery_entry(item: GalleryItem, index: int, total: int, mode: str) -
         f"Gallery - {index + 1}/{total} ({mode})\n"
         f"#{item.item_id} “{item.title}”\n"
         f"by {author} · 👍 {len(item.likes)}\n"
+        f"Share: {bot_link(f'g{item.item_id}')}\n"
         "⬇ Get sends you the file. 👻✨"
     )
 
