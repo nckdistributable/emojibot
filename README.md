@@ -41,13 +41,28 @@ docker compose up --build
    - image (photo or `image/*` document)
    - several photos in one album (animated into a single emoji)
    - GIF (as a file or animation)
-   - video (as a file or video message)
+   - video (as a file, video message, or round video note)
+   - a public http(s) link to an image, GIF, or video
 2. The bot returns a ready file:
    - `.tgs` is sent as `emoji.tgs.zip` so Telegram keeps it downloadable. Unzip before uploading to @Stickers.
    - `.webm` (VP9, 100x100, <=3s, <=30fps, <=256KB) for video emoji
    - `.png` 100x100 for static emoji
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
+
+### Sending a link
+
+Paste a public `http(s)` link to an image, GIF, or video and the bot fetches
+it and converts it like an uploaded file. Only public addresses are accepted:
+links resolving to loopback, private, link-local or otherwise reserved ranges
+are refused, redirects are re-checked at every hop, and the download stops at
+`MAX_FILE_MB`.
+
+### Inline mode
+
+With inline mode enabled for the bot in @BotFather (`/setinline`), typing
+`@yourbot` in any chat lists the last 10 emoji you made so you can send one
+straight into the conversation. The list lives in memory and is per user.
 
 ### Sprite sheets and whole packs
 
@@ -174,7 +189,7 @@ Per-user settings are available via `/settings`:
 
 ## Notes
 
-- Supported: animated `.tgs` stickers, `.webm` video stickers, static stickers, images, GIFs, and videos.
+- Supported: animated `.tgs` stickers, `.webm` video stickers, static stickers, images, GIFs, videos, round video notes, and public image/video links.
 - `lottie` is required to scale `.tgs` correctly.
 - `ffmpeg` is required for video emoji (`.webm` VP9, 100x100, <=3s, <=30fps, <=256KB).
 - `Pillow` is required for images and static stickers. For WebP on macOS, install `webp` via Homebrew and reinstall Pillow.
