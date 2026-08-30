@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, Message, User
 from aiogram.types.input_file import FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -58,6 +58,10 @@ class UserSettings:
     image_bg: str = "black"
     image_output: str = "static"
     album_mode: str = "animate"
+    motion: str = "normal"
+    long_video: str = "trim"
+    trim_start: int = 0
+    trim_end: int = 0
 
 
 MAX_ACTIVE_DAYS = 60
@@ -320,36 +324,117 @@ def run_cmd(args: list[str]) -> bool:
     return result.returncode == 0
 
 
-def build_video_filter(settings: UserSettings) -> str:
-    if settings.video_fit == "crop":
-        scale = (
-            "scale=100:100:flags=lanczos:force_original_aspect_ratio=increase"
-        )
-        crop = "crop=100:100"
-        filters = [scale, crop]
-    else:
-        color = "0x00000000" if settings.video_bg == "transparent" else "black"
-        scale = (
-            "scale=100:100:flags=lanczos:force_original_aspect_ratio=decrease"
-        )
-        pad = f"pad=100:100:(ow-iw)/2:(oh-ih)/2:color={color}"
-        filters = [scale, pad]
+def build_scale_filters(fit: str, bg: str) -> list[str]:
+    if fit == "crop":
+        return [
+            "scale=100:100:flags=lanczos:force_original_aspect_ratio=increase",
+            "crop=100:100",
+        ]
+    color = "0x00000000" if bg == "transparent" else "black"
+    return [
+        "scale=100:100:flags=lanczos:force_original_aspect_ratio=decrease",
+        f"pad=100:100:(ow-iw)/2:(oh-ih)/2:color={color}",
+    ]
 
+
+def build_video_filter(settings: UserSettings) -> str:
+    filters = build_scale_filters(settings.video_fit, settings.video_bg)
     filters.append(f"fps={settings.video_fps}")
     return ",".join(filters)
+
+
+def motion_filter(motion: str) -> str:
+    if motion == "reverse":
+        return "reverse"
+    if motion == "boomerang":
+        # Play the clip, then play it backwards, as one stream.
+        return "split[m0][m1];[m1]reverse[m1r];[m0][m1r]concat=n=2:v=1"
+    return ""
+
+
+def probe_duration(path: Path) -> Optional[float]:
+    if not command_exists("ffprobe"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=nw=1:nk=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def target_seconds(settings: UserSettings) -> float:
+    target = float(max(1, min(3, settings.video_duration)))
+    if settings.motion == "boomerang":
+        # The clip is played forward then backward, so source only needs half.
+        target /= 2
+    return target
+
+
+def build_encode_plan(
+    input_path: Path, settings: UserSettings, config: Config
+) -> tuple[list[str], str]:
+    """Build the ffmpeg args that go before -i, plus the -vf filter chain."""
+    target = target_seconds(settings)
+    pre_args: list[str] = []
+
+    start = max(0, settings.trim_start)
+    if start:
+        pre_args += ["-ss", str(start)]
+    window: Optional[float] = None
+    if settings.trim_end > start:
+        window = float(settings.trim_end - start)
+
+    filters = build_scale_filters(settings.video_fit, settings.video_bg)
+
+    if settings.long_video == "speedup":
+        source = probe_duration(input_path)
+        available = None
+        if source is not None:
+            available = max(0.0, source - start)
+            if window is not None:
+                available = min(available, window)
+            available = min(available, float(config.max_duration_seconds))
+        if available and available > target:
+            # Squeeze the whole clip into the target length instead of cutting.
+            filters.append(f"setpts=PTS/{available / target:.6f}")
+            pre_args += ["-t", f"{available:.3f}"]
+        else:
+            pre_args += ["-t", f"{target:.3f}"]
+    else:
+        limit = target if window is None else min(target, window)
+        pre_args += ["-t", f"{limit:.3f}"]
+
+    filters.append(f"fps={settings.video_fps}")
+    motion = motion_filter(settings.motion)
+    if motion:
+        filters.append(motion)
+    return pre_args, ",".join(filters)
 
 
 def convert_video_to_video_emoji(
     input_path: Path,
     output_path: Path,
     settings: UserSettings,
+    config: Config,
     size_limit_bytes: int = 256 * 1024,
 ) -> bool:
     if not command_exists("ffmpeg"):
         return False
 
-    duration = max(1, min(3, settings.video_duration))
-    video_filter = build_video_filter(settings)
+    pre_args, video_filter = build_encode_plan(input_path, settings, config)
     pix_fmt = "yuva420p" if settings.video_bg == "transparent" else "yuv420p"
 
     attempts = [
@@ -363,10 +448,9 @@ def convert_video_to_video_emoji(
             [
                 "ffmpeg",
                 "-y",
+                *pre_args,
                 "-i",
                 str(input_path),
-                "-t",
-                str(duration),
                 "-vf",
                 video_filter,
                 "-an",
@@ -510,9 +594,14 @@ def convert_frames_to_video_emoji(
     if not command_exists("ffmpeg") or frame_count < 1:
         return False
 
-    duration = max(1, min(3, settings.video_duration))
-    # Spread the frames evenly over the clip: N frames in `duration` seconds.
-    input_rate = f"{frame_count}/{duration}"
+    target = target_seconds(settings)
+    # Spread the frames evenly over the clip: N frames in `target` seconds.
+    input_rate = f"{frame_count / target:.6f}"
+    frame_filters = [f"fps={settings.video_fps}"]
+    motion = motion_filter(settings.motion)
+    if motion:
+        frame_filters.append(motion)
+    frame_filter = ",".join(frame_filters)
     pix_fmt = "yuva420p" if settings.image_bg == "transparent" else "yuv420p"
 
     attempts = [
@@ -531,7 +620,7 @@ def convert_frames_to_video_emoji(
                 "-i",
                 pattern,
                 "-vf",
-                f"fps={settings.video_fps}",
+                frame_filter,
                 "-an",
                 "-c:v",
                 "libvpx-vp9",
@@ -564,37 +653,28 @@ def convert_frames_to_gif(
 ) -> bool:
     if not command_exists("ffmpeg") or frame_count < 1:
         return False
-    duration = max(1, min(3, settings.video_duration))
-    return run_cmd(
-        [
-            "ffmpeg",
-            "-y",
-            "-framerate",
-            f"{frame_count}/{duration}",
-            "-i",
-            pattern,
-            "-loop",
-            "0",
-            str(output_path),
-        ]
-    )
+    target = target_seconds(settings)
+    args = ["ffmpeg", "-y", "-framerate", f"{frame_count / target:.6f}", "-i", pattern]
+    motion = motion_filter(settings.motion)
+    if motion:
+        args += ["-vf", motion]
+    args += ["-loop", "0", str(output_path)]
+    return run_cmd(args)
 
 
 def convert_webm_to_mp4(
-    input_path: Path, output_path: Path, settings: UserSettings
+    input_path: Path, output_path: Path, settings: UserSettings, config: Config
 ) -> bool:
     if not command_exists("ffmpeg"):
         return False
-    duration = max(1, min(3, settings.video_duration))
-    video_filter = build_video_filter(settings)
+    pre_args, video_filter = build_encode_plan(input_path, settings, config)
     return run_cmd(
         [
             "ffmpeg",
             "-y",
+            *pre_args,
             "-i",
             str(input_path),
-            "-t",
-            str(duration),
             "-vf",
             video_filter,
             "-movflags",
@@ -607,20 +687,18 @@ def convert_webm_to_mp4(
 
 
 def convert_webm_to_gif(
-    input_path: Path, output_path: Path, settings: UserSettings
+    input_path: Path, output_path: Path, settings: UserSettings, config: Config
 ) -> bool:
     if not command_exists("ffmpeg"):
         return False
-    duration = max(1, min(3, settings.video_duration))
-    video_filter = build_video_filter(settings)
+    pre_args, video_filter = build_encode_plan(input_path, settings, config)
     return run_cmd(
         [
             "ffmpeg",
             "-y",
+            *pre_args,
             "-i",
             str(input_path),
-            "-t",
-            str(duration),
             "-vf",
             video_filter,
             str(output_path),
@@ -691,8 +769,15 @@ def build_settings_keyboard(settings: UserSettings) -> InlineKeyboardBuilder:
         text=f"Album: {settings.album_mode}",
         callback_data="set:album_mode",
     )
+    builder.button(
+        text=f"Motion: {settings.motion}", callback_data="set:motion"
+    )
+    builder.button(
+        text=f"Long video: {settings.long_video}",
+        callback_data="set:long_video",
+    )
     builder.button(text="Reset", callback_data="set:reset")
-    builder.adjust(2, 2, 2, 1, 1, 1)
+    builder.adjust(2, 2, 2, 2, 2, 1)
     return builder
 
 
@@ -700,6 +785,35 @@ def build_help_keyboard() -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     builder.button(text="Open @Stickers", url="https://t.me/stickers")
     return builder
+
+
+def format_trim(settings: UserSettings) -> str:
+    if settings.trim_end > settings.trim_start:
+        return f"{settings.trim_start}-{settings.trim_end}s"
+    if settings.trim_start:
+        return f"from {settings.trim_start}s"
+    return "off"
+
+
+def parse_trim(raw: str) -> Optional[tuple[int, int]]:
+    """Parse '12', '2-5' or '2 5' into (start, end). None means invalid."""
+    text = raw.strip().replace("-", " ").replace(":", " ")
+    if not text:
+        return None
+    parts = text.split()
+    if len(parts) > 2:
+        return None
+    try:
+        values = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if any(value < 0 for value in values):
+        return None
+    start = values[0]
+    end = values[1] if len(values) == 2 else 0
+    if end and end <= start:
+        return None
+    return start, end
 
 
 def format_settings(settings: UserSettings) -> str:
@@ -715,6 +829,11 @@ def format_settings(settings: UserSettings) -> str:
         "(static = .png, video = .webm)\n"
         f"- Album: {settings.album_mode} "
         "(animate = one animated emoji, separate = one emoji per image)\n"
+        f"- Motion: {settings.motion} "
+        "(normal, reverse, or boomerang)\n"
+        f"- Long video: {settings.long_video} "
+        "(trim = cut, speedup = squeeze it all in)\n"
+        f"- Trim: {format_trim(settings)} (set with /trim)\n"
         "\nTap buttons to change."
     )
 
@@ -956,7 +1075,7 @@ async def process_video_file(
             f" Input was longer than {config.max_duration_seconds}s and was trimmed."
         )
 
-    ok = convert_video_to_video_emoji(input_path, output_webm, settings)
+    ok = convert_video_to_video_emoji(input_path, output_webm, settings, config)
     if ok:
         await send_file(
             message,
@@ -966,7 +1085,7 @@ async def process_video_file(
         stats.inc("video_emoji")
         return
 
-    mp4_ok = convert_webm_to_mp4(input_path, output_mp4, settings)
+    mp4_ok = convert_webm_to_mp4(input_path, output_mp4, settings, config)
     if mp4_ok:
         await send_file(
             message,
@@ -976,7 +1095,7 @@ async def process_video_file(
         stats.inc("video_fallback_mp4")
         return
 
-    gif_ok = convert_webm_to_gif(input_path, output_gif, settings)
+    gif_ok = convert_webm_to_gif(input_path, output_gif, settings, config)
     if gif_ok:
         await send_file(
             message,
@@ -1157,6 +1276,38 @@ async def track_request(message: Message, kind: str) -> None:
         await message.answer(milestone_text(stat.count))
 
 
+async def handle_trim(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+    raw = (command.args or "").strip()
+
+    if not raw or raw.lower() in {"off", "reset", "none"}:
+        settings.trim_start = 0
+        settings.trim_end = 0
+        await message.answer(
+            "Trim is off. I will take the clip from the start. 👻✨"
+        )
+        return
+
+    parsed = parse_trim(raw)
+    if parsed is None:
+        await message.answer(
+            "Use /trim 2-5 to take seconds 2 to 5, /trim 2 to start at 2s, "
+            "or /trim off. 👻✨"
+        )
+        return
+
+    start, end = parsed
+    settings.trim_start = start
+    settings.trim_end = end
+    await message.answer(
+        f"Trim set to {format_trim(settings)}. Send a video or GIF. 👻✨"
+    )
+
+
 async def handle_stats(message: Message) -> None:
     config = get_config()
     if not is_admin(message.from_user.id if message.from_user else None, config):
@@ -1318,6 +1469,14 @@ async def handle_settings_callback(query: CallbackQuery) -> None:
     elif action == "album_mode":
         settings.album_mode = (
             "separate" if settings.album_mode == "animate" else "animate"
+        )
+    elif action == "motion":
+        order = ["normal", "reverse", "boomerang"]
+        index = order.index(settings.motion) if settings.motion in order else 0
+        settings.motion = order[(index + 1) % len(order)]
+    elif action == "long_video":
+        settings.long_video = (
+            "speedup" if settings.long_video == "trim" else "trim"
         )
     elif action == "reset":
         user_settings[user_id] = UserSettings()
@@ -1551,6 +1710,7 @@ async def main() -> None:
     dp.message.register(handle_start, CommandStart())
     dp.message.register(handle_help, Command("help"))
     dp.message.register(handle_settings, Command("settings"))
+    dp.message.register(handle_trim, Command("trim"))
     dp.message.register(handle_me, Command("me"))
     dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))

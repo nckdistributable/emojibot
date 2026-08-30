@@ -49,6 +49,20 @@ docker compose up --build
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
 
+### Motion, speed and trimming
+
+Video, GIF and photo-series emoji can be reshaped before encoding:
+
+- **Motion** (`/settings`): `normal`, `reverse` (play backwards), or
+  `boomerang` (forward then backwards; the source window is halved so the
+  result still fits the duration limit).
+- **Long video** (`/settings`): `trim` cuts the clip at `Video duration`,
+  `speedup` squeezes the whole clip into it instead of cutting.
+- **`/trim`** picks which part of the clip to use:
+  - `/trim 2-5` - use seconds 2 to 5
+  - `/trim 2` - start at 2s
+  - `/trim off` - back to the start of the clip
+
 ### Animating a series of photos into one emoji
 
 Send several photos **as one album** and the bot stitches them into a single
@@ -76,7 +90,8 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 
 - `/start` - show supported formats.
 - `/help` - short usage info and a link to @Stickers.
-- `/settings` - adjust fit, background, FPS, and duration.
+- `/settings` - adjust fit, background, FPS, duration, motion, and album handling.
+- `/trim` - pick which part of a clip to use (`/trim 2-5`, `/trim 2`, `/trim off`).
 - `/me` - your personal record: how many emoji you made, your rank, how long you have been using the bot, your favorite format, active days, current streak, and unlocked achievements.
 - `/top` - leaderboard of the most active users, with your own position marked.
 - `/health` - simple health check.
@@ -114,6 +129,8 @@ Per-user settings are available via `/settings`:
 - Image background: `black` or `transparent`
 - Image output: `static` (100x100 `.png`) or `video` (looping `.webm` video emoji built from the image)
 - Album: `animate` (several photos become one animated emoji) or `separate` (one emoji per photo)
+- Motion: `normal`, `reverse`, or `boomerang`
+- Long video: `trim` (cut at the duration limit) or `speedup` (fit the whole clip into it)
 
 ## Environment Variables
 
