@@ -11,7 +11,7 @@ import tempfile
 import time
 import zipfile
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
@@ -66,6 +66,7 @@ class Config:
     concurrency: int = 2
     stats_file: str = "stats.json"
     presets_file: str = "presets.json"
+    settings_file: str = "settings.json"
 
 
 @dataclass
@@ -155,6 +156,48 @@ BUILTIN_PRESETS: dict[str, dict] = {
 }
 
 
+def dump_json(data: object) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def ensure_parent(path: Path) -> None:
+    if path.parent and not path.parent.exists():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+
+def write_json_atomic(path: Path, blob: str, label: str) -> bool:
+    """Write via a temp file and rename, so a crash cannot truncate the file."""
+    try:
+        ensure_parent(path)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(blob, encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception:
+        logging.getLogger("emojibot").warning(
+            "Failed to persist %s to %s", label, path, exc_info=True
+        )
+        return False
+
+
+def read_json_file(path: Optional[Path], label: str) -> Optional[object]:
+    if path is None:
+        return None
+    ensure_parent(path)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logging.getLogger("emojibot").warning(
+            "Failed to load %s from %s; starting fresh", label, path, exc_info=True
+        )
+        return None
+
+
 def parse_day(value: str) -> Optional[date]:
     try:
         return date.fromisoformat(value)
@@ -238,36 +281,13 @@ class Stats:
     def save(self) -> None:
         if self.path is None:
             return
-        try:
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(
-                json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(self.path)
-        except Exception:
-            logging.getLogger("emojibot").warning(
-                "Failed to persist stats to %s", self.path, exc_info=True
-            )
+        write_json_atomic(self.path, dump_json(self.to_dict()), "stats")
 
 
 def load_stats(path: Optional[Path]) -> Stats:
     stats = Stats(start_time=time.monotonic(), path=path)
-    if path is None:
-        return stats
-    if path.parent and not path.parent.exists():
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-    if not path.exists():
-        return stats
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logging.getLogger("emojibot").warning(
-            "Failed to load stats from %s; starting fresh", path, exc_info=True
-        )
+    data = read_json_file(path, "stats")
+    if not isinstance(data, dict):
         return stats
 
     counts = data.get("counts")
@@ -362,6 +382,7 @@ def load_config() -> Config:
     concurrency = parse_int(os.getenv("CONCURRENCY", "2"), 2)
     stats_file = os.getenv("STATS_FILE", "stats.json").strip()
     presets_file = os.getenv("PRESETS_FILE", "presets.json").strip()
+    settings_file = os.getenv("SETTINGS_FILE", "settings.json").strip()
 
     return Config(
         token=token,
@@ -373,6 +394,7 @@ def load_config() -> Config:
         concurrency=max(1, concurrency),
         stats_file=stats_file,
         presets_file=presets_file,
+        settings_file=settings_file,
     )
 
 
@@ -1111,29 +1133,13 @@ def presets_to_dict() -> dict:
 def save_presets(path: Optional[Path]) -> None:
     if path is None:
         return
-    try:
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(
-            json.dumps(presets_to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(path)
-    except Exception:
-        logging.getLogger("emojibot").warning(
-            "Failed to persist presets to %s", path, exc_info=True
-        )
+    write_json_atomic(path, dump_json(presets_to_dict()), "presets")
 
 
 def load_presets(path: Optional[Path]) -> None:
     user_presets.clear()
-    if path is None or not path.exists():
-        return
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logging.getLogger("emojibot").warning(
-            "Failed to load presets from %s; starting fresh", path, exc_info=True
-        )
+    data = read_json_file(path, "presets")
+    if not isinstance(data, dict):
         return
     users = data.get("users")
     if not isinstance(users, dict):
@@ -1152,6 +1158,98 @@ def load_presets(path: Optional[Path]) -> None:
                 clean_presets[str(name)[:32]] = clean
         if clean_presets:
             user_presets[user_id] = clean_presets
+
+
+# Settings change on every button tap, so they are flushed on a timer and
+# only when the content actually differs, rather than on each mutation.
+SETTINGS_FLUSH_SECONDS = 10
+_settings_blob = ""
+
+
+def settings_path() -> Optional[Path]:
+    config = app_config
+    if config is None or not config.settings_file:
+        return None
+    return Path(config.settings_file)
+
+
+def sanitize_settings(data: object) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    defaults = UserSettings()
+    clean: dict = {}
+    for spec in fields(UserSettings):
+        if spec.name not in data:
+            continue
+        value = data[spec.name]
+        expected = getattr(defaults, spec.name)
+        if isinstance(expected, bool):
+            continue
+        if isinstance(expected, int):
+            try:
+                clean[spec.name] = int(value)
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(value, str):
+            clean[spec.name] = value[:64]
+    return clean
+
+
+def settings_to_dict() -> dict:
+    return {
+        "users": {
+            str(user_id): {
+                spec.name: getattr(settings, spec.name)
+                for spec in fields(UserSettings)
+            }
+            for user_id, settings in user_settings.items()
+        }
+    }
+
+
+def save_settings(path: Optional[Path], force: bool = False) -> bool:
+    global _settings_blob
+    if path is None:
+        return False
+    blob = dump_json(settings_to_dict())
+    if not force and blob == _settings_blob:
+        return False
+    if write_json_atomic(path, blob, "settings"):
+        _settings_blob = blob
+        return True
+    return False
+
+
+def load_settings(path: Optional[Path]) -> None:
+    global _settings_blob
+    user_settings.clear()
+    data = read_json_file(path, "settings")
+    if isinstance(data, dict):
+        users = data.get("users")
+        if isinstance(users, dict):
+            for raw_id, values in users.items():
+                try:
+                    user_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                clean = sanitize_settings(values)
+                if clean:
+                    user_settings[user_id] = UserSettings(**clean)
+    _settings_blob = dump_json(settings_to_dict())
+
+
+async def settings_flusher(path: Path) -> None:
+    while True:
+        try:
+            await asyncio.sleep(SETTINGS_FLUSH_SECONDS)
+            save_settings(path)
+        except asyncio.CancelledError:
+            save_settings(path)
+            raise
+        except Exception:
+            logging.getLogger("emojibot").warning(
+                "Settings flush failed", exc_info=True
+            )
 
 
 def get_settings(user_id: int) -> UserSettings:
@@ -2981,6 +3079,10 @@ async def main() -> None:
     if user_presets:
         logger.info("Loaded presets for %d users", len(user_presets))
 
+    load_settings(settings_path())
+    if user_settings:
+        logger.info("Loaded settings for %d users", len(user_settings))
+
     bot = Bot(token=config.token)
     dp = Dispatcher()
 
@@ -3021,7 +3123,25 @@ async def main() -> None:
     dp.message.register(handle_unsupported)
     dp.inline_query.register(handle_inline)
 
-    await dp.start_polling(bot)
+    flush_path = settings_path()
+    flusher: Optional[asyncio.Task] = None
+    if flush_path is not None:
+        flusher = asyncio.create_task(settings_flusher(flush_path))
+
+        async def flush_on_shutdown() -> None:
+            save_settings(flush_path)
+
+        dp.shutdown.register(flush_on_shutdown)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if flusher is not None:
+            flusher.cancel()
+            try:
+                await flusher
+            except asyncio.CancelledError:
+                pass
 
 
 if __name__ == "__main__":
