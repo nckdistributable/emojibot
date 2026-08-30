@@ -1,7 +1,9 @@
 import asyncio
+import ipaddress
 import json
 import logging
 import os
+import socket
 import shutil
 import subprocess
 import tempfile
@@ -11,10 +13,17 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, Message, User
+from aiogram.types import (
+    CallbackQuery,
+    InlineQuery,
+    InlineQueryResultCachedDocument,
+    Message,
+    User,
+)
 from aiogram.types.input_file import FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -25,6 +34,13 @@ try:
     PIL_AVAILABLE = True
 except Exception:
     PIL_AVAILABLE = False
+
+try:
+    import aiohttp
+
+    AIOHTTP_AVAILABLE = True
+except Exception:
+    AIOHTTP_AVAILABLE = False
 
 try:
     from lottie.exporters.tgs import export_tgs
@@ -80,6 +96,7 @@ TYPE_LABELS = {
     "video": "videos",
     "document": "files",
     "album": "photo series",
+    "url": "links",
 }
 # Formats that count toward the "tried every format" achievement. Albums are
 # deliberately excluded so the badge keeps the meaning it had when it shipped.
@@ -877,6 +894,107 @@ def convert_webm_to_gif(
     )
 
 
+URL_TIMEOUT_SECONDS = 20
+URL_MAX_REDIRECTS = 3
+URL_EXTENSIONS = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+}
+
+
+def is_public_host(host: str) -> bool:
+    """Reject anything that resolves into a private or reserved range."""
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        address = info[4][0]
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return False
+    return True
+
+
+def safe_url(url: str) -> Optional[str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if not is_public_host(parsed.hostname or ""):
+        return None
+    return url
+
+
+def guess_url_mime(url: str, header: str) -> str:
+    mime = (header or "").split(";")[0].strip().lower()
+    if mime and mime != "application/octet-stream":
+        return mime
+    suffix = Path(urlparse(url).path).suffix.lower()
+    return URL_EXTENSIONS.get(suffix, "")
+
+
+async def download_url(url: str, dest: Path, config: Config) -> Optional[str]:
+    """Fetch a public URL into dest. Returns the MIME type, or None."""
+    if not AIOHTTP_AVAILABLE:
+        return None
+    timeout = aiohttp.ClientTimeout(total=URL_TIMEOUT_SECONDS)
+    current = safe_url(url)
+    if current is None:
+        return None
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for _ in range(URL_MAX_REDIRECTS + 1):
+            try:
+                async with session.get(current, allow_redirects=False) as response:
+                    if response.status in (301, 302, 303, 307, 308):
+                        location = response.headers.get("Location", "")
+                        if not location:
+                            return None
+                        # Re-check every hop so a redirect cannot reach inside.
+                        current = safe_url(urljoin(current, location))
+                        if current is None:
+                            return None
+                        continue
+                    if response.status != 200:
+                        return None
+                    declared = response.headers.get("Content-Length")
+                    if declared and int(declared) > config.max_file_bytes:
+                        return None
+                    total = 0
+                    with dest.open("wb") as handle:
+                        async for chunk in response.content.iter_chunked(65536):
+                            total += len(chunk)
+                            if total > config.max_file_bytes:
+                                return None
+                            handle.write(chunk)
+                    return guess_url_mime(
+                        current, response.headers.get("Content-Type", "")
+                    )
+            except Exception:
+                return None
+    return None
+
+
 def get_settings(user_id: int) -> UserSettings:
     settings = user_settings.get(user_id)
     if not settings:
@@ -1460,6 +1578,42 @@ async def process_video_file(
 
     await message.answer("Could not process the video. Try another file. 👻✨")
 
+MAX_RECENT_FILES = 10
+# Per-user file_ids of emoji the bot produced, newest first, for inline reuse.
+recent_files: dict[int, list[tuple[str, str]]] = {}
+
+
+def remember_file(user: Optional[User], sent: object, title: str) -> None:
+    if user is None or sent is None:
+        return
+    document = getattr(sent, "document", None)
+    file_id = getattr(document, "file_id", None)
+    if not file_id:
+        return
+    items = recent_files.setdefault(user.id, [])
+    items.insert(0, (file_id, title))
+    del items[MAX_RECENT_FILES:]
+
+
+async def handle_inline(query: InlineQuery) -> None:
+    config = get_config()
+    user_id = query.from_user.id if query.from_user else 0
+    if not is_allowed(user_id, config):
+        await query.answer([], cache_time=5, is_personal=True)
+        return
+    items = recent_files.get(user_id, [])
+    results = [
+        InlineQueryResultCachedDocument(
+            id=f"recent{index}",
+            title=title,
+            document_file_id=file_id,
+            caption="Made with EmojiBot 👻✨",
+        )
+        for index, (file_id, title) in enumerate(items)
+    ]
+    await query.answer(results, cache_time=5, is_personal=True)
+
+
 async def send_file(
     message: Message,
     path: Path,
@@ -1469,12 +1623,13 @@ async def send_file(
     disable_content_type_detection: bool = False,
 ) -> None:
     keyboard = build_help_keyboard().as_markup() if include_help else None
-    await message.answer_document(
+    sent = await message.answer_document(
         FSInputFile(str(path), filename=filename),
         caption=caption,
         reply_markup=keyboard,
         disable_content_type_detection=disable_content_type_detection,
     )
+    remember_file(message.from_user, sent, filename or path.name)
 
 
 async def reject_if_not_allowed(message: Message, config: Config) -> bool:
@@ -1910,6 +2065,87 @@ async def handle_settings_callback(query: CallbackQuery) -> None:
     await query.answer()
 
 
+async def handle_video_note(message: Message, bot: Bot) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    note = message.video_note
+    if not note:
+        return
+    if file_too_large(note.file_size, config):
+        await message.answer(
+            f"File is too large. Max {max_file_mb(config)} MB. 👻✨"
+        )
+        return
+    stats.inc("video_note_in")
+    await track_request(message, "video")
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+    file = await bot.get_file(note.file_id)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        input_note = tmpdir_path / "input.note"
+        await bot.download_file(file.file_path, destination=input_note)
+        async with semaphore:
+            await process_video_file(
+                message, input_note, settings, config, duration=note.duration
+            )
+
+
+async def handle_text_message(message: Message) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    text = (message.text or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        await message.answer(SUPPORTED_FORMATS_TEXT)
+        return
+
+    if not AIOHTTP_AVAILABLE:
+        await message.answer("Link mode not available. 👻✨")
+        return
+    if safe_url(text.split()[0]) is None:
+        await message.answer(
+            "That link is not reachable. Send a public http(s) link. 👻✨"
+        )
+        return
+
+    url = text.split()[0]
+    stats.inc("url_in")
+    await track_request(message, "url")
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+
+    await message.answer("Fetching that link... 👻✨")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        downloaded = tmpdir_path / "input.url"
+        mime = await download_url(url, downloaded, config)
+        if mime is None or not downloaded.exists() or not downloaded.stat().st_size:
+            await message.answer(
+                "Could not download that link. Check it is public and under "
+                f"{max_file_mb(config)} MB. 👻✨"
+            )
+            return
+
+        if mime == "image/gif":
+            async with semaphore:
+                await process_video_file(message, downloaded, settings, config)
+            return
+        if mime.startswith("image/"):
+            async with semaphore:
+                await process_image_file(message, downloaded, settings, config)
+            return
+        if mime.startswith("video/"):
+            async with semaphore:
+                await process_video_file(message, downloaded, settings, config)
+            return
+
+    await message.answer(
+        "That link is not an image or a video. 👻✨"
+    )
+
+
 async def handle_unsupported(message: Message) -> None:
     config = get_config()
     if await reject_if_not_allowed(message, config):
@@ -2147,7 +2383,10 @@ async def main() -> None:
     dp.message.register(handle_animation, F.animation)
     dp.message.register(handle_video, F.video)
     dp.message.register(handle_document, F.document)
+    dp.message.register(handle_video_note, F.video_note)
+    dp.message.register(handle_text_message, F.text)
     dp.message.register(handle_unsupported)
+    dp.inline_query.register(handle_inline)
 
     await dp.start_polling(bot)
 
