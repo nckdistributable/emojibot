@@ -50,6 +50,35 @@ docker compose up --build
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
 
+### Making emoji out of text
+
+`/make BOO` draws the text as an emoji. A longer phrase is spread across up
+to 10 tiles that line up into a banner when added in order — letters run
+across tile borders, so the pieces only read as a word together. Cyrillic and
+other scripts work as long as a system font covers them (the Docker image
+ships DejaVu).
+
+The text is white with a black outline, on the background from `Image
+background`, and each tile respects `Image output`, so `video` gives you
+`.webm` tiles. With a pack open the tiles are added to it in order.
+
+### Gallery
+
+Emoji can be shared with everyone using the bot:
+
+```
+/publish <title>       publish the emoji you just made
+/gallery               browse, newest first
+/gallery top           browse by likes
+/gallery mine          list your own entries
+/publish remove <id>   take one of yours down
+```
+
+Browsing is one message with ◀ ▶ to move, 👍 to like (one per person, press
+again to undo), and ⬇ Get to have the file sent to you. Publishing is
+explicit and attributes your username; up to 20 entries per person. Admins
+can take down any entry with `/gallery remove <id>`.
+
 ### Presets
 
 There are a lot of settings now, so they can be saved as named recipes:
@@ -187,6 +216,9 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 - `/sheet` - slice a grid image into animation frames (`/sheet 4x3`, `/sheet off`).
 - `/pack` - build a real Telegram emoji pack (`/pack new <title>`, `/pack finish`).
 - `/preset` - save and reuse a look (`/preset use retro`, `/preset save neon`, `/preset share neon`).
+- `/make` - draw text as emoji, split into banner tiles if long (`/make BOO`).
+- `/publish` - publish the emoji you just made to the gallery (`/publish remove <id>` takes it down).
+- `/gallery` - browse published emoji (`/gallery top`, `/gallery mine`, admin `/gallery remove <id>`).
 - `/me` - your personal record: how many emoji you made, your rank, how long you have been using the bot, your favorite format, active days, current streak, and unlocked achievements.
 - `/top` - leaderboard of the most active users, with your own position marked.
 - `/health` - simple health check.
@@ -242,6 +274,7 @@ configuration.
 - `CONCURRENCY` (default: `2`)
 - `ALLOWED_USER_IDS` (comma-separated)
 - `ADMIN_USER_IDS` (comma-separated)
+- `GALLERY_FILE` (default: `gallery.json`) - path to the JSON file holding published gallery entries. Empty disables the gallery store.
 - `SETTINGS_FILE` (default: `settings.json`) - path to the JSON file where per-user settings are stored. Empty disables saving them (in-memory only).
 - `PRESETS_FILE` (default: `presets.json`) - path to the JSON file where user presets are stored. Empty disables saving them.
 - `STATS_FILE` (default: `stats.json`) - path to the JSON file where usage stats are persisted. Set to an empty value to disable persistence (in-memory only).

@@ -67,6 +67,7 @@ class Config:
     stats_file: str = "stats.json"
     presets_file: str = "presets.json"
     settings_file: str = "settings.json"
+    gallery_file: str = "gallery.json"
 
 
 @dataclass
@@ -102,6 +103,7 @@ TYPE_LABELS = {
     "document": "files",
     "album": "photo series",
     "url": "links",
+    "text": "text emoji",
 }
 # Formats that count toward the "tried every format" achievement. Albums are
 # deliberately excluded so the badge keeps the meaning it had when it shipped.
@@ -427,6 +429,7 @@ def load_config() -> Config:
     stats_file = os.getenv("STATS_FILE", "stats.json").strip()
     presets_file = os.getenv("PRESETS_FILE", "presets.json").strip()
     settings_file = os.getenv("SETTINGS_FILE", "settings.json").strip()
+    gallery_file = os.getenv("GALLERY_FILE", "gallery.json").strip()
 
     return Config(
         token=token,
@@ -439,6 +442,7 @@ def load_config() -> Config:
         stats_file=stats_file,
         presets_file=presets_file,
         settings_file=settings_file,
+        gallery_file=gallery_file,
     )
 
 
@@ -761,6 +765,53 @@ def draw_caption(img: Image.Image, text: str) -> Image.Image:
         stroke_fill=(0, 0, 0, 255),
     )
     return img
+
+
+TEXT_TILE = 100
+MAX_TEXT_TILES = 10
+MAX_TEXT_CHARS = 40
+
+
+def render_text_tiles(text: str, settings: UserSettings) -> list:
+    """Render a phrase across one or more 100x100 tiles, as a banner."""
+    text = text.strip()
+    if not text:
+        return []
+
+    transparent = settings.image_bg == "transparent"
+    background = (0, 0, 0, 0) if transparent else (0, 0, 0, 255)
+    stroke = 3
+    max_width = MAX_TEXT_TILES * TEXT_TILE - 12
+    probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+
+    size = 84
+    font = load_font(size)
+    while size > 10:
+        font = load_font(size)
+        box = probe.textbbox((0, 0), text, font=font, stroke_width=stroke)
+        if box[3] - box[1] <= TEXT_TILE - 12 and box[2] - box[0] <= max_width:
+            break
+        size -= 4
+
+    box = probe.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    width, height = box[2] - box[0], box[3] - box[1]
+    tiles = (width + 12 + TEXT_TILE - 1) // TEXT_TILE
+    tiles = max(1, min(MAX_TEXT_TILES, tiles))
+
+    canvas = Image.new("RGBA", (tiles * TEXT_TILE, TEXT_TILE), background)
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        ((tiles * TEXT_TILE - width) // 2 - box[0], (TEXT_TILE - height) // 2 - box[1]),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+        stroke_width=stroke,
+        stroke_fill=(0, 0, 0, 255),
+    )
+    return [
+        canvas.crop((i * TEXT_TILE, 0, (i + 1) * TEXT_TILE, TEXT_TILE))
+        for i in range(tiles)
+    ]
 
 
 def apply_image_effects(img: Image.Image, settings: UserSettings) -> Image.Image:
@@ -2097,6 +2148,95 @@ async def add_to_pack(message: Message, path: Path) -> None:
     )
 
 
+MAX_GALLERY_PER_USER = 20
+GALLERY_FLUSH_SECONDS = 10
+
+
+@dataclass
+class GalleryItem:
+    item_id: int
+    file_id: str
+    title: str
+    author_id: int
+    author: str
+    created: float = 0.0
+    likes: list[int] = field(default_factory=list)
+
+
+gallery_items: list[GalleryItem] = []
+gallery_flusher: Optional["JsonFlusher"] = None
+
+
+def gallery_path() -> Optional[Path]:
+    config = app_config
+    if config is None or not config.gallery_file:
+        return None
+    return Path(config.gallery_file)
+
+
+def gallery_to_dict() -> dict:
+    return {
+        "items": [
+            {
+                "item_id": item.item_id,
+                "file_id": item.file_id,
+                "title": item.title,
+                "author_id": item.author_id,
+                "author": item.author,
+                "created": item.created,
+                "likes": item.likes,
+            }
+            for item in gallery_items
+        ]
+    }
+
+
+def load_gallery(path: Optional[Path]) -> None:
+    gallery_items.clear()
+    data = read_json_file(path, "gallery")
+    if not isinstance(data, dict):
+        return
+    for raw in data.get("items") or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            likes = [
+                int(value)
+                for value in (raw.get("likes") or [])
+                if isinstance(value, (int, str)) and str(value).lstrip("-").isdigit()
+            ]
+            gallery_items.append(
+                GalleryItem(
+                    item_id=int(raw["item_id"]),
+                    file_id=str(raw["file_id"]),
+                    title=str(raw.get("title", ""))[:64],
+                    author_id=int(raw.get("author_id", 0)),
+                    author=str(raw.get("author", ""))[:64],
+                    created=float(raw.get("created", 0.0)),
+                    likes=likes,
+                )
+            )
+        except Exception:
+            continue
+
+
+def next_gallery_id() -> int:
+    return max((item.item_id for item in gallery_items), default=0) + 1
+
+
+def sorted_gallery(mode: str) -> list[GalleryItem]:
+    if mode == "top":
+        return sorted(
+            gallery_items, key=lambda i: (len(i.likes), i.created), reverse=True
+        )
+    return sorted(gallery_items, key=lambda i: i.created, reverse=True)
+
+
+def save_gallery() -> None:
+    if gallery_flusher is not None:
+        gallery_flusher.flush()
+
+
 MAX_RECENT_FILES = 10
 # Per-user file_ids of emoji the bot produced, newest first, for inline reuse.
 recent_files: dict[int, list[tuple[str, str]]] = {}
@@ -2591,6 +2731,241 @@ async def handle_preset(message: Message, command: CommandObject) -> None:
         return
 
     await message.answer(PRESET_HELP)
+
+
+async def handle_make(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    if not PIL_AVAILABLE:
+        await message.answer("Image mode not available. 👻✨")
+        return
+
+    raw = (command.args or "").strip()[:MAX_TEXT_CHARS]
+    if not raw:
+        await message.answer(
+            "Send /make BOO and I will draw it as emoji. A longer phrase is "
+            "split into tiles that line up into a banner. 👻✨"
+        )
+        return
+
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+    tiles = render_text_tiles(raw, settings)
+    if not tiles:
+        await message.answer("Could not draw that text. 👻✨")
+        return
+
+    stats.inc("make_in")
+    await track_request(message, "text")
+    as_video = settings.image_output == "video" and command_exists("ffmpeg")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        for index, tile in enumerate(tiles, start=1):
+            png_path = tmpdir_path / f"emoji_{index:02d}.png"
+            tile.save(png_path, format="PNG")
+            output = png_path
+            if as_video:
+                clip = tmpdir_path / f"emoji_{index:02d}.webm"
+                if convert_image_to_video_emoji(png_path, clip, settings):
+                    output = clip
+            position = f" ({index}/{len(tiles)})" if len(tiles) > 1 else ""
+            await send_file(message, output, f"“{raw}”{position} 👻✨")
+
+    if len(tiles) > 1:
+        await message.answer(
+            f"Add all {len(tiles)} in this order and they line up into "
+            "a banner. 👻✨"
+        )
+    stats.inc("make_done")
+
+
+def build_gallery_keyboard(
+    index: int, mode: str, item: GalleryItem
+) -> InlineKeyboardBuilder:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="◀", callback_data=f"gal:prev:{index}:{mode}")
+    builder.button(text=f"👍 {len(item.likes)}", callback_data=f"gal:like:{index}:{mode}")
+    builder.button(text="⬇ Get", callback_data=f"gal:get:{index}:{mode}")
+    builder.button(text="▶", callback_data=f"gal:next:{index}:{mode}")
+    other = "newest" if mode == "top" else "top"
+    builder.button(text=f"Sort: {other}", callback_data=f"gal:mode:{index}:{other}")
+    builder.adjust(4, 1)
+    return builder
+
+
+def format_gallery_entry(item: GalleryItem, index: int, total: int, mode: str) -> str:
+    author = f"@{item.author}" if item.author else f"id {item.author_id}"
+    return (
+        f"Gallery - {index + 1}/{total} ({mode})\n"
+        f"#{item.item_id} “{item.title}”\n"
+        f"by {author} · 👍 {len(item.likes)}\n"
+        "⬇ Get sends you the file. 👻✨"
+    )
+
+
+async def show_gallery(message: Message, index: int, mode: str, edit: bool) -> None:
+    items = sorted_gallery(mode)
+    if not items:
+        await message.answer(
+            "The gallery is empty. Make an emoji and /publish it. 👻✨"
+        )
+        return
+    index = max(0, min(index, len(items) - 1))
+    item = items[index]
+    text = format_gallery_entry(item, index, len(items), mode)
+    markup = build_gallery_keyboard(index, mode, item).as_markup()
+    if edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+
+async def handle_publish(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user = message.from_user
+    if user is None:
+        return
+    recent = recent_files.get(user.id) or []
+    if not recent:
+        await message.answer(
+            "Make an emoji first, then /publish it to the gallery. 👻✨"
+        )
+        return
+
+    mine = [item for item in gallery_items if item.author_id == user.id]
+    if len(mine) >= MAX_GALLERY_PER_USER:
+        await message.answer(
+            f"You already have {MAX_GALLERY_PER_USER} entries. Remove one "
+            "with /publish remove <id>. 👻✨"
+        )
+        return
+
+    raw = (command.args or "").strip()
+    parts = raw.split(maxsplit=1)
+    if parts and parts[0].lower() == "remove":
+        target = parts[1].strip() if len(parts) > 1 else ""
+        for item in list(gallery_items):
+            if str(item.item_id) == target and item.author_id == user.id:
+                gallery_items.remove(item)
+                save_gallery()
+                await message.answer(f"Removed #{item.item_id}. 👻✨")
+                return
+        await message.answer("No entry of yours with that id. 👻✨")
+        return
+
+    file_id, name = recent[0]
+    item = GalleryItem(
+        item_id=next_gallery_id(),
+        file_id=file_id,
+        title=(raw[:64] or name),
+        author_id=user.id,
+        author=user.username or "",
+        created=time.time(),
+    )
+    gallery_items.append(item)
+    save_gallery()
+    stats.inc("gallery_published")
+    await message.answer(
+        f"Published #{item.item_id} “{item.title}” to the gallery. "
+        "Browse it with /gallery. 👻✨"
+    )
+
+
+async def handle_gallery(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    parts = (command.args or "").strip().split(maxsplit=1)
+    action = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if action == "remove":
+        if not is_admin(message.from_user.id if message.from_user else None, config):
+            await message.answer(
+                "Only admins can remove other entries. Use /publish remove "
+                "<id> for your own. 👻✨"
+            )
+            return
+        for item in list(gallery_items):
+            if str(item.item_id) == rest:
+                gallery_items.remove(item)
+                save_gallery()
+                await message.answer(f"Removed #{item.item_id}. 👻✨")
+                return
+        await message.answer("No entry with that id. 👻✨")
+        return
+
+    if action == "mine":
+        user_id = message.from_user.id if message.from_user else 0
+        mine = [item for item in gallery_items if item.author_id == user_id]
+        if not mine:
+            await message.answer("You have not published anything yet. 👻✨")
+            return
+        lines = [f"#{item.item_id} “{item.title}” · 👍 {len(item.likes)}" for item in mine]
+        await message.answer(
+            "\n".join(lines) + "\nRemove one with /publish remove <id>. 👻✨"
+        )
+        return
+
+    await show_gallery(message, 0, "top" if action == "top" else "newest", edit=False)
+
+
+async def handle_gallery_callback(query: CallbackQuery) -> None:
+    config = get_config()
+    user_id = query.from_user.id if query.from_user else 0
+    if not is_allowed(user_id, config):
+        await query.answer("Access denied. 👻✨", show_alert=True)
+        return
+
+    pieces = (query.data or "").split(":")
+    if len(pieces) < 4:
+        await query.answer()
+        return
+    action, raw_index, mode = pieces[1], pieces[2], pieces[3]
+    try:
+        index = int(raw_index)
+    except ValueError:
+        index = 0
+
+    items = sorted_gallery(mode)
+    if not items:
+        await query.answer("The gallery is empty. 👻✨", show_alert=True)
+        return
+    index = max(0, min(index, len(items) - 1))
+
+    if action == "prev":
+        index = (index - 1) % len(items)
+    elif action == "next":
+        index = (index + 1) % len(items)
+    elif action == "like":
+        item = items[index]
+        if user_id in item.likes:
+            item.likes.remove(user_id)
+            await query.answer("Like removed. 👻✨")
+        else:
+            item.likes.append(user_id)
+            stats.inc("gallery_liked")
+            await query.answer("Liked! 👻✨")
+        save_gallery()
+    elif action == "get":
+        item = items[index]
+        stats.inc("gallery_fetched")
+        await query.answer("Sending it over. 👻✨")
+        await query.message.answer_document(
+            item.file_id, caption=f"#{item.item_id} “{item.title}” 👻✨"
+        )
+        return
+    elif action != "mode":
+        await query.answer()
+        return
+
+    if action != "like":
+        await query.answer()
+    await show_gallery(query.message, index, mode, edit=True)
 
 
 async def handle_stats(message: Message) -> None:
@@ -3098,11 +3473,20 @@ async def main() -> None:
     if user_settings:
         logger.info("Loaded settings for %d users", len(user_settings))
 
+    load_gallery(gallery_path())
+    if gallery_items:
+        logger.info("Loaded %d gallery entries", len(gallery_items))
+
+    global gallery_flusher
+    gallery_flusher = JsonFlusher(
+        "gallery", gallery_path(), gallery_to_dict, GALLERY_FLUSH_SECONDS
+    )
     flushers = [
         JsonFlusher(
             "settings", settings_path(), settings_to_dict, SETTINGS_FLUSH_SECONDS
         ),
         JsonFlusher("stats", stats_path, stats.to_dict, STATS_FLUSH_SECONDS),
+        gallery_flusher,
     ]
     for flusher in flushers:
         flusher.sync()
@@ -3126,6 +3510,9 @@ async def main() -> None:
     dp.message.register(handle_sheet, Command("sheet"))
     dp.message.register(handle_pack, Command("pack"))
     dp.message.register(handle_preset, Command("preset"))
+    dp.message.register(handle_make, Command("make"))
+    dp.message.register(handle_publish, Command("publish"))
+    dp.message.register(handle_gallery, Command("gallery"))
     dp.message.register(handle_me, Command("me"))
     dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))
@@ -3136,6 +3523,9 @@ async def main() -> None:
     )
     dp.callback_query.register(
         handle_edit_callback, F.data.startswith("edit:")
+    )
+    dp.callback_query.register(
+        handle_gallery_callback, F.data.startswith("gal:")
     )
     dp.message.register(handle_sticker, F.sticker)
     dp.message.register(handle_photo, F.photo)
