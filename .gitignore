@@ -9,3 +9,5 @@ __pycache__/
 # Persisted runtime stats
 stats.json
 stats.json.tmp
+presets.json
+presets.json.tmp

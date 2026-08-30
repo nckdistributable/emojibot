@@ -50,6 +50,28 @@ docker compose up --build
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
 
+### Presets
+
+There are a lot of settings now, so they can be saved as named recipes:
+
+```
+/preset list              built-in ones and yours
+/preset use retro         apply it
+/preset save neon         remember the current look
+/preset share neon        get a code to pass around
+/preset import <code>     apply someone else's code
+/preset delete neon
+```
+
+Built-in: `sticker`, `video`, `boomerang`, `retro`, `noir`.
+
+A preset carries the **look** — fit, background, filter, outline, motion,
+output, fps, duration — and deliberately not the caption, trim or sheet
+grid, which belong to the job you set them for. Imported codes are filtered
+down to known style fields, so a code can only change the look.
+
+Presets are saved to `PRESETS_FILE` and survive restarts.
+
 ### Tweaking the result without re-uploading
 
 Every converted file comes back with buttons under it — background, fit,
@@ -164,6 +186,7 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 - `/text` - draw a caption on the emoji (`/text BOO!`, `/text off`).
 - `/sheet` - slice a grid image into animation frames (`/sheet 4x3`, `/sheet off`).
 - `/pack` - build a real Telegram emoji pack (`/pack new <title>`, `/pack finish`).
+- `/preset` - save and reuse a look (`/preset use retro`, `/preset save neon`, `/preset share neon`).
 - `/me` - your personal record: how many emoji you made, your rank, how long you have been using the bot, your favorite format, active days, current streak, and unlocked achievements.
 - `/top` - leaderboard of the most active users, with your own position marked.
 - `/health` - simple health check.
@@ -216,6 +239,7 @@ Per-user settings are available via `/settings`:
 - `CONCURRENCY` (default: `2`)
 - `ALLOWED_USER_IDS` (comma-separated)
 - `ADMIN_USER_IDS` (comma-separated)
+- `PRESETS_FILE` (default: `presets.json`) - path to the JSON file where user presets are stored. Empty disables saving them.
 - `STATS_FILE` (default: `stats.json`) - path to the JSON file where usage stats are persisted. Set to an empty value to disable persistence (in-memory only).
 
 ## Notes

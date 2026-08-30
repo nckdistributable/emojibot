@@ -5,6 +5,7 @@ services:
       - .env
     environment:
       STATS_FILE: /data/stats.json
+      PRESETS_FILE: /data/presets.json
     restart: unless-stopped
     volumes:
       - emojibot_data:/data
