@@ -21,6 +21,7 @@ from urllib.parse import urljoin, urlparse
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineQuery,
     InlineQueryResultCachedDocument,
@@ -91,6 +92,7 @@ class UserSettings:
     text: str = ""
     sheet_cols: int = 0
     sheet_rows: int = 0
+    lang: str = ""
 
 
 MAX_ACTIVE_DAYS = 60
@@ -427,11 +429,164 @@ def load_stats(path: Optional[Path]) -> Stats:
     return stats
 
 
-SUPPORTED_FORMATS_TEXT = (
-    "Send: sticker, animated sticker, image, GIF, or video. "
-    "Send several photos at once and I will animate them into one emoji. "
-    "I will return an emoji-ready file. 👻✨"
-)
+LANGS = ("en", "ru")
+TEXTS: dict[str, dict[str, str]] = {
+    "formats": {
+        "en": (
+            "Send: sticker, animated sticker, image, GIF, or video. "
+            "Send several photos at once and I will animate them into one "
+            "emoji. I will return an emoji-ready file. 👻✨"
+        ),
+        "ru": (
+            "Пришли стикер, анимированный стикер, картинку, GIF или видео. "
+            "Несколько фото одним альбомом соберу в одно анимированное "
+            "эмодзи. В ответ пришлю готовый файл. 👻✨"
+        ),
+    },
+    "welcome": {
+        "en": (
+            "Hi! I turn anything into a Telegram emoji. 👻✨\n\n"
+            "Try it right now: send me a photo and I will send back a "
+            "ready emoji.\n\n"
+            "Then you can:\n"
+            "• /pack new My pack - and I will build the emoji pack for you\n"
+            "• /make BOO - draw text as emoji\n"
+            "• /settings - change the look, /help - everything else"
+        ),
+        "ru": (
+            "Привет! Я делаю эмодзи для Telegram из чего угодно. 👻✨\n\n"
+            "Попробуй прямо сейчас: пришли фотографию, и я верну готовое "
+            "эмодзи.\n\n"
+            "А дальше можно:\n"
+            "• /pack new Мой пак — и я сам соберу пак эмодзи\n"
+            "• /make БУ — нарисовать текст как эмодзи\n"
+            "• /settings — изменить вид, /help — всё остальное"
+        ),
+    },
+    "help": {
+        "en": (
+            "Send a sticker, animated sticker, image, GIF, or video. 👻✨\n"
+            "Send several photos in one album and I will turn them into a "
+            "single animated emoji. 👻✨\n"
+            "Use /pack new <title> and I will build a real emoji pack. 👻✨\n"
+            "/make <text> draws text as emoji. 👻✨\n"
+            "/settings changes the look, /preset saves it, /gallery shows "
+            "what others made. 👻✨"
+        ),
+        "ru": (
+            "Пришли стикер, анимированный стикер, картинку, GIF или видео. 👻✨\n"
+            "Несколько фото одним альбомом станут одним анимированным "
+            "эмодзи. 👻✨\n"
+            "/pack new <название> — соберу настоящий пак эмодзи. 👻✨\n"
+            "/make <текст> — нарисую текст как эмодзи. 👻✨\n"
+            "/settings меняет вид, /preset сохраняет его, /gallery покажет "
+            "работы других. 👻✨"
+        ),
+    },
+    "denied": {
+        "en": "Access denied. The bouncer says “no”. 👻✨",
+        "ru": "Доступ закрыт. Охрана не пускает. 👻✨",
+    },
+    "too_large": {
+        "en": "File is too large. Max {mb} MB. 👻✨",
+        "ru": "Файл слишком большой. Максимум {mb} МБ. 👻✨",
+    },
+    "healthy": {
+        "en": "All clear. Systems are spooky. 👻✨",
+        "ru": "Всё в порядке. Системы призрачно стабильны. 👻✨",
+    },
+    "png_ready": {
+        "en": "Here is your 100x100 .png for a static emoji. 👻✨",
+        "ru": "Держи .png 100x100 для статичного эмодзи. 👻✨",
+    },
+    "webm_ready": {
+        "en": "Here is your .webm for video emoji (VP9).{note} 👻✨",
+        "ru": "Держи .webm для видео-эмодзи (VP9).{note} 👻✨",
+    },
+    "trimmed_note": {
+        "en": " Input was longer than {limit}s and was trimmed.",
+        "ru": " Исходник был длиннее {limit}с и был обрезан.",
+    },
+    "image_from_video": {
+        "en": "Here is your .webm video emoji made from a static image (VP9). 👻✨",
+        "ru": "Держи видео-эмодзи .webm, сделанное из картинки (VP9). 👻✨",
+    },
+    "album_ready": {
+        "en": "Here is your animated emoji from {count} images (VP9 .webm). 👻✨",
+        "ru": "Держи анимированное эмодзи из {count} картинок (VP9 .webm). 👻✨",
+    },
+    "fallback_mp4": {
+        "en": "Video emoji limits were too tight. Here is .mp4 instead.{note} 👻✨",
+        "ru": "В лимиты видео-эмодзи не уложился. Держи .mp4.{note} 👻✨",
+    },
+    "fallback_gif": {
+        "en": "Video emoji limits were too tight. Here is a .gif instead. 👻✨",
+        "ru": "В лимиты видео-эмодзи не уложился. Держи .gif. 👻✨",
+    },
+    "image_failed": {
+        "en": "Could not process the image. Try another file. 👻✨",
+        "ru": "Не смог обработать картинку. Попробуй другой файл. 👻✨",
+    },
+    "video_failed": {
+        "en": "Could not process the video. Try another file. 👻✨",
+        "ru": "Не смог обработать видео. Попробуй другой файл. 👻✨",
+    },
+    "album_failed": {
+        "en": "Could not build an emoji from those images. 👻✨",
+        "ru": "Не смог собрать эмодзи из этих картинок. 👻✨",
+    },
+    "video_unavailable": {
+        "en": "Video mode not available. 👻✨",
+        "ru": "Видео-режим недоступен. 👻✨",
+    },
+    "image_unavailable": {
+        "en": "Image mode not available. 👻✨",
+        "ru": "Режим картинок недоступен. 👻✨",
+    },
+    "banner_hint": {
+        "en": "Add all {count} in this order and they line up into a banner. 👻✨",
+        "ru": "Добавь все {count} по порядку — сложатся в баннер. 👻✨",
+    },
+    "lang_set": {
+        "en": "Language set to English. 👻✨",
+        "ru": "Язык переключён на русский. 👻✨",
+    },
+    "lang_help": {
+        "en": "Current language: {lang}. Switch with /lang en or /lang ru. 👻✨",
+        "ru": "Текущий язык: {lang}. Переключить: /lang en или /lang ru. 👻✨",
+    },
+}
+
+
+def t(key: str, lang: str, /, **values) -> str:
+    """Positional-only head, so a placeholder may be named key or lang."""
+    entry = TEXTS.get(key, {})
+    text = entry.get(lang) or entry.get("en") or key
+    return text.format(**values) if values else text
+
+
+def lang_of(user_id: int) -> str:
+    settings = user_settings.get(user_id)
+    if settings and settings.lang in LANGS:
+        return settings.lang
+    return "en"
+
+
+def ensure_lang(user: Optional[User]) -> str:
+    """Pick a language from the client's locale the first time we see someone."""
+    if user is None:
+        return "en"
+    settings = get_settings(user.id)
+    if settings.lang not in LANGS:
+        code = (getattr(user, "language_code", "") or "").lower()
+        settings.lang = "ru" if code.startswith("ru") else "en"
+    return settings.lang
+
+
+def message_lang(message: Message) -> str:
+    return ensure_lang(message.from_user)
+
+
 user_settings: dict[int, UserSettings] = {}
 stats = Stats(start_time=time.monotonic())
 semaphore: Optional[asyncio.Semaphore] = None
@@ -1523,7 +1678,7 @@ async def handle_edit_callback(query: CallbackQuery) -> None:
     config = get_config()
     user_id = query.from_user.id if query.from_user else 0
     if not is_allowed(user_id, config):
-        await query.answer("Access denied. 👻✨", show_alert=True)
+        await query.answer(t("denied", ensure_lang(query.from_user)), show_alert=True)
         return
 
     session = edit_sessions.get(user_id)
@@ -1724,7 +1879,7 @@ async def process_image_as_video(
     config: Config,
 ) -> None:
     if not command_exists("ffmpeg"):
-        await message.answer("Video mode not available. 👻✨")
+        await message.answer(t("video_unavailable", message_lang(message)))
         return
 
     # Render through the image pipeline first so effects (filter, outline,
@@ -1741,7 +1896,7 @@ async def process_image_as_video(
         await send_file(
             message,
             output_webm,
-            "Here is your .webm video emoji made from a static image (VP9). 👻✨",
+            t("image_from_video", message_lang(message)),
         )
         stats.inc("image_video_emoji")
         return
@@ -1759,7 +1914,7 @@ async def process_image_as_video(
         stats.inc("image")
         return
 
-    await message.answer("Could not process the image. Try another file. 👻✨")
+    await message.answer(t("image_failed", message_lang(message)))
 
 
 @dataclass
@@ -1800,7 +1955,7 @@ async def flush_album_later(group_id: str, bot: Bot) -> None:
             "Failed to process album %s", group_id, exc_info=True
         )
         await buffer.message.answer(
-            "Could not build an emoji from those images. 👻✨"
+            t("album_failed", message_lang(buffer.message))
         )
 
 
@@ -1850,10 +2005,10 @@ async def process_album(buffer: AlbumBuffer, bot: Bot) -> None:
     settings = get_settings(user_id)
 
     if not PIL_AVAILABLE:
-        await message.answer("Image mode not available. 👻✨")
+        await message.answer(t("image_unavailable", message_lang(message)))
         return
     if not command_exists("ffmpeg"):
-        await message.answer("Video mode not available. 👻✨")
+        await message.answer(t("video_unavailable", message_lang(message)))
         return
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1899,8 +2054,7 @@ async def process_album(buffer: AlbumBuffer, bot: Bot) -> None:
             await send_file(
                 message,
                 output_webm,
-                f"Here is your animated emoji from {frames} images "
-                "(VP9 .webm). 👻✨",
+                t("album_ready", message_lang(message), count=frames),
             )
             stats.inc("album_video_emoji")
             return
@@ -1920,9 +2074,7 @@ async def process_album(buffer: AlbumBuffer, bot: Bot) -> None:
             stats.inc("album_fallback_gif")
             return
 
-        await message.answer(
-            "Could not build an emoji from those images. 👻✨"
-        )
+        await message.answer(t("album_failed", message_lang(message)))
 
 
 def slice_sheet(
@@ -1963,10 +2115,10 @@ async def process_sprite_sheet(
     config: Config,
 ) -> None:
     if not PIL_AVAILABLE:
-        await message.answer("Image mode not available. 👻✨")
+        await message.answer(t("image_unavailable", message_lang(message)))
         return
     if not command_exists("ffmpeg"):
-        await message.answer("Video mode not available. 👻✨")
+        await message.answer(t("video_unavailable", message_lang(message)))
         return
 
     out_dir = input_path.parent
@@ -2025,9 +2177,7 @@ async def process_image_file(
         await process_image_as_video(message, input_path, settings, config)
         return
     if not PIL_AVAILABLE:
-        await message.answer(
-            "Image mode not available. 👻✨"
-        )
+        await message.answer(t("image_unavailable", message_lang(message)))
         return
     output_png = input_path.with_name("emoji.png")
     ok = convert_image_to_png_emoji(input_path, output_png, settings)
@@ -2035,11 +2185,11 @@ async def process_image_file(
         await send_file(
             message,
             output_png,
-            "Here is your 100x100 .png for a static emoji. 👻✨",
+            t("png_ready", message_lang(message)),
         )
         stats.inc("image")
         return
-    await message.answer("Could not process the image. Try another file. 👻✨")
+    await message.answer(t("image_failed", message_lang(message)))
 
 
 async def process_video_file(
@@ -2050,9 +2200,7 @@ async def process_video_file(
     duration: Optional[int] = None,
 ) -> None:
     if not command_exists("ffmpeg"):
-        await message.answer(
-            "Video mode not available. 👻✨"
-        )
+        await message.answer(t("video_unavailable", message_lang(message)))
         return
 
     remember_source(message, input_path, "video")
@@ -2062,8 +2210,10 @@ async def process_video_file(
 
     trimmed_note = ""
     if duration is not None and duration > config.max_duration_seconds:
-        trimmed_note = (
-            f" Input was longer than {config.max_duration_seconds}s and was trimmed."
+        trimmed_note = t(
+            "trimmed_note",
+            message_lang(message),
+            limit=config.max_duration_seconds,
         )
 
     ok = convert_video_to_video_emoji(input_path, output_webm, settings, config)
@@ -2071,7 +2221,7 @@ async def process_video_file(
         await send_file(
             message,
             output_webm,
-            f"Here is your .webm for video emoji (VP9).{trimmed_note} 👻✨",
+            t("webm_ready", message_lang(message), note=trimmed_note),
         )
         stats.inc("video_emoji")
         return
@@ -2081,7 +2231,7 @@ async def process_video_file(
         await send_file(
             message,
             output_mp4,
-            f"Video emoji limits were too tight. Here is .mp4 instead.{trimmed_note} 👻✨",
+            t("fallback_mp4", message_lang(message), note=trimmed_note),
         )
         stats.inc("video_fallback_mp4")
         return
@@ -2096,7 +2246,7 @@ async def process_video_file(
         stats.inc("video_fallback_gif")
         return
 
-    await message.answer("Could not process the video. Try another file. 👻✨")
+    await message.answer(t("video_failed", message_lang(message)))
 
 EDIT_SESSION_TTL_SECONDS = 30 * 60
 
@@ -2384,9 +2534,10 @@ async def send_file(
 
 
 async def reject_if_not_allowed(message: Message, config: Config) -> bool:
+    lang = message_lang(message)
     user_id = message.from_user.id if message.from_user else None
     if not is_allowed(user_id, config):
-        await message.answer("Access denied. The bouncer says “no”. 👻✨")
+        await message.answer(t("denied", lang))
         return True
     return False
 
@@ -2395,6 +2546,50 @@ def get_config() -> Config:
     if app_config is None:
         raise RuntimeError("Config is not initialized")
     return app_config
+
+COMMAND_MENU = {
+    "en": [
+        ("start", "What I can do"),
+        ("make", "Draw text as emoji"),
+        ("pack", "Build an emoji pack"),
+        ("settings", "Change the look"),
+        ("preset", "Save and reuse a look"),
+        ("gallery", "See what others made"),
+        ("me", "Your record"),
+        ("lang", "Change language"),
+        ("help", "Help"),
+    ],
+    "ru": [
+        ("start", "Что я умею"),
+        ("make", "Нарисовать текст как эмодзи"),
+        ("pack", "Собрать пак эмодзи"),
+        ("settings", "Изменить вид"),
+        ("preset", "Сохранить и переиспользовать вид"),
+        ("gallery", "Работы других"),
+        ("me", "Твоя статистика"),
+        ("lang", "Сменить язык"),
+        ("help", "Помощь"),
+    ],
+}
+
+
+async def publish_command_menu(bot: Bot) -> None:
+    """Show the command list in the client UI, in both languages."""
+    for lang, entries in COMMAND_MENU.items():
+        commands = [
+            BotCommand(command=name, description=description)
+            for name, description in entries
+        ]
+        try:
+            if lang == "en":
+                await bot.set_my_commands(commands)
+            else:
+                await bot.set_my_commands(commands, language_code=lang)
+        except Exception:
+            logging.getLogger("emojibot").warning(
+                "Could not publish the %s command menu", lang, exc_info=True
+            )
+
 
 def bot_link(payload: str = "") -> str:
     base = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
@@ -2464,7 +2659,8 @@ async def handle_start(message: Message, command: CommandObject) -> None:
                 await show_gallery(message, index, "newest", edit=False)
                 return
 
-    await message.answer(SUPPORTED_FORMATS_TEXT)
+    lang = message_lang(message)
+    await message.answer(t("welcome" if is_new else "formats", lang))
     if is_new:
         stats.inc("user_joined")
 
@@ -2525,16 +2721,10 @@ async def handle_help(message: Message) -> None:
     config = get_config()
     if await reject_if_not_allowed(message, config):
         return
-    text = (
-        "Send a sticker, animated sticker, image, GIF, or video. 👻✨\n"
-        "Send several photos in one album and I will turn them into a single "
-        "animated emoji. 👻✨\n"
-        "Use /pack new <title> and I will build a real emoji pack for you. 👻✨\n"
-        "I will return a file you can upload to @Stickers. 👻✨\n"
-        "Use /settings to tweak fit, background, FPS, and duration. 👻✨\n"
-        "Use /me for your own record and /top for the leaderboard. 👻✨"
+    await message.answer(
+        t("help", message_lang(message)),
+        reply_markup=build_help_keyboard().as_markup(),
     )
-    await message.answer(text, reply_markup=build_help_keyboard().as_markup())
 
 
 async def handle_settings(message: Message) -> None:
@@ -2943,7 +3133,7 @@ async def handle_make(message: Message, command: CommandObject) -> None:
     if await reject_if_not_allowed(message, config):
         return
     if not PIL_AVAILABLE:
-        await message.answer("Image mode not available. 👻✨")
+        await message.answer(t("image_unavailable", message_lang(message)))
         return
 
     raw = (command.args or "").strip()[:MAX_TEXT_CHARS]
@@ -2980,8 +3170,7 @@ async def handle_make(message: Message, command: CommandObject) -> None:
 
     if len(tiles) > 1:
         await message.answer(
-            f"Add all {len(tiles)} in this order and they line up into "
-            "a banner. 👻✨"
+            t("banner_hint", message_lang(message), count=len(tiles))
         )
     stats.inc("make_done")
 
@@ -3124,7 +3313,7 @@ async def handle_gallery_callback(query: CallbackQuery) -> None:
     config = get_config()
     user_id = query.from_user.id if query.from_user else 0
     if not is_allowed(user_id, config):
-        await query.answer("Access denied. 👻✨", show_alert=True)
+        await query.answer(t("denied", ensure_lang(query.from_user)), show_alert=True)
         return
 
     pieces = (query.data or "").split(":")
@@ -3172,6 +3361,20 @@ async def handle_gallery_callback(query: CallbackQuery) -> None:
     if action != "like":
         await query.answer()
     await show_gallery(query.message, index, mode, edit=True)
+
+
+async def handle_lang(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+    wanted = (command.args or "").strip().lower()[:5]
+    if wanted in LANGS:
+        settings.lang = wanted
+        await message.answer(t("lang_set", wanted))
+        return
+    await message.answer(t("lang_help", lang_of(user_id), lang=lang_of(user_id)))
 
 
 async def handle_stats(message: Message) -> None:
@@ -3299,14 +3502,14 @@ async def handle_health(message: Message) -> None:
     config = get_config()
     if await reject_if_not_allowed(message, config):
         return
-    await message.answer("All clear. Systems are spooky. 👻✨")
+    await message.answer(t("healthy", message_lang(message)))
 
 
 async def handle_settings_callback(query: CallbackQuery) -> None:
     config = get_config()
     user_id = query.from_user.id if query.from_user else 0
     if not is_allowed(user_id, config):
-        await query.answer("Access denied. The bouncer says “no”. 👻✨", show_alert=True)
+        await query.answer(t("denied", ensure_lang(query.from_user)), show_alert=True)
         return
     settings = get_settings(user_id)
     data = query.data or ""
@@ -3386,7 +3589,7 @@ async def handle_video_note(message: Message, bot: Bot) -> None:
         return
     if file_too_large(note.file_size, config):
         await message.answer(
-            f"File is too large. Max {max_file_mb(config)} MB. 👻✨"
+            t("too_large", message_lang(message), mb=max_file_mb(config))
         )
         return
     stats.inc("video_note_in")
@@ -3410,7 +3613,7 @@ async def handle_text_message(message: Message) -> None:
         return
     text = (message.text or "").strip()
     if not text.lower().startswith(("http://", "https://")):
-        await message.answer(SUPPORTED_FORMATS_TEXT)
+        await message.answer(t("formats", message_lang(message)))
         return
 
     if not AIOHTTP_AVAILABLE:
@@ -3462,7 +3665,7 @@ async def handle_unsupported(message: Message) -> None:
     config = get_config()
     if await reject_if_not_allowed(message, config):
         return
-    await message.answer(SUPPORTED_FORMATS_TEXT)
+    await message.answer(t("formats", message_lang(message)))
 
 
 async def handle_sticker(message: Message, bot: Bot) -> None:
@@ -3474,7 +3677,7 @@ async def handle_sticker(message: Message, bot: Bot) -> None:
         return
     if file_too_large(sticker.file_size, config):
         await message.answer(
-            f"File is too large. Max {max_file_mb(config)} MB. 👻✨"
+            t("too_large", message_lang(message), mb=max_file_mb(config))
         )
         return
 
@@ -3531,7 +3734,7 @@ async def handle_photo(message: Message, bot: Bot) -> None:
         return
     if file_too_large(photo.file_size, config):
         await message.answer(
-            f"File is too large. Max {max_file_mb(config)} MB. 👻✨"
+            t("too_large", message_lang(message), mb=max_file_mb(config))
         )
         return
     user_id = message.from_user.id if message.from_user else 0
@@ -3563,7 +3766,7 @@ async def handle_animation(message: Message, bot: Bot) -> None:
         return
     if file_too_large(animation.file_size, config):
         await message.answer(
-            f"File is too large. Max {max_file_mb(config)} MB. 👻✨"
+            t("too_large", message_lang(message), mb=max_file_mb(config))
         )
         return
     stats.inc("animation_in")
@@ -3591,7 +3794,7 @@ async def handle_video(message: Message, bot: Bot) -> None:
         return
     if file_too_large(video.file_size, config):
         await message.answer(
-            f"File is too large. Max {max_file_mb(config)} MB. 👻✨"
+            t("too_large", message_lang(message), mb=max_file_mb(config))
         )
         return
     stats.inc("video_in")
@@ -3619,7 +3822,7 @@ async def handle_document(message: Message, bot: Bot) -> None:
         return
     if file_too_large(doc.file_size, config):
         await message.answer(
-            f"File is too large. Max {max_file_mb(config)} MB. 👻✨"
+            t("too_large", message_lang(message), mb=max_file_mb(config))
         )
         return
     stats.inc("document_in")
@@ -3649,7 +3852,7 @@ async def handle_document(message: Message, bot: Bot) -> None:
                 )
             return
 
-    await message.answer(SUPPORTED_FORMATS_TEXT)
+    await message.answer(t("formats", message_lang(message)))
 
 
 async def main() -> None:
@@ -3707,6 +3910,7 @@ async def main() -> None:
         me = await bot.me()
         bot_username = me.username or ""
         logger.info("Running as @%s", bot_username)
+        await publish_command_menu(bot)
     except Exception:
         logger.warning("Could not resolve the bot username", exc_info=True)
 
@@ -3723,6 +3927,7 @@ async def main() -> None:
     dp.message.register(handle_gallery, Command("gallery"))
     dp.message.register(handle_invite, Command("invite"))
     dp.message.register(handle_sources, Command("sources"))
+    dp.message.register(handle_lang, Command("lang"))
     dp.message.register(handle_me, Command("me"))
     dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))
