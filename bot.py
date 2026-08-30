@@ -20,7 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 try:
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
     PIL_AVAILABLE = True
 except Exception:
@@ -62,6 +62,10 @@ class UserSettings:
     long_video: str = "trim"
     trim_start: int = 0
     trim_end: int = 0
+    image_filter: str = "none"
+    outline: str = "off"
+    cut_bg: str = "off"
+    text: str = ""
 
 
 MAX_ACTIVE_DAYS = 60
@@ -343,6 +347,22 @@ def build_video_filter(settings: UserSettings) -> str:
     return ",".join(filters)
 
 
+def video_color_filter(name: str) -> str:
+    """ffmpeg equivalent of the image filters, for real video sources."""
+    if name == "bw":
+        return "hue=s=0"
+    if name == "invert":
+        return "negate"
+    if name == "sepia":
+        return (
+            "colorchannelmixer="
+            ".393:.769:.189:0:.349:.686:.168:0:.272:.534:.131"
+        )
+    if name == "pixel":
+        return "scale=20:20:flags=neighbor,scale=100:100:flags=neighbor"
+    return ""
+
+
 def motion_filter(motion: str) -> str:
     if motion == "reverse":
         return "reverse"
@@ -417,6 +437,9 @@ def build_encode_plan(
         limit = target if window is None else min(target, window)
         pre_args += ["-t", f"{limit:.3f}"]
 
+    color = video_color_filter(settings.image_filter)
+    if color:
+        filters.append(color)
     filters.append(f"fps={settings.video_fps}")
     motion = motion_filter(settings.motion)
     if motion:
@@ -477,6 +500,143 @@ def convert_video_to_video_emoji(
     return False
 
 
+FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+)
+IMAGE_FILTERS = ("none", "bw", "invert", "sepia", "pixel")
+OUTLINE_MODES = ("off", "white", "black")
+
+
+def load_font(size: int):
+    for candidate in FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def remove_background(img: Image.Image, tolerance: int = 40) -> Image.Image:
+    """Clear pixels connected to a corner that match that corner's color."""
+    img = img.convert("RGBA")
+    width, height = img.size
+    pixels = img.load()
+    limit = tolerance * 3
+    visited = bytearray(width * height)
+    queue: list[tuple[int, int, tuple[int, int, int]]] = []
+
+    for corner in ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)):
+        red, green, blue, alpha = pixels[corner]
+        if alpha:
+            queue.append((corner[0], corner[1], (red, green, blue)))
+
+    while queue:
+        x, y, reference = queue.pop()
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue
+        index = y * width + x
+        if visited[index]:
+            continue
+        red, green, blue, alpha = pixels[x, y]
+        if alpha == 0:
+            visited[index] = 1
+            continue
+        distance = (
+            abs(red - reference[0])
+            + abs(green - reference[1])
+            + abs(blue - reference[2])
+        )
+        if distance > limit:
+            continue
+        visited[index] = 1
+        pixels[x, y] = (red, green, blue, 0)
+        queue.extend(
+            [
+                (x + 1, y, reference),
+                (x - 1, y, reference),
+                (x, y + 1, reference),
+                (x, y - 1, reference),
+            ]
+        )
+    return img
+
+
+def apply_image_filter(img: Image.Image, name: str) -> Image.Image:
+    if name == "none" or name not in IMAGE_FILTERS:
+        return img
+    alpha = img.getchannel("A")
+    rgb = img.convert("RGB")
+    if name == "bw":
+        rgb = ImageOps.grayscale(rgb).convert("RGB")
+    elif name == "invert":
+        rgb = ImageOps.invert(rgb)
+    elif name == "sepia":
+        rgb = ImageOps.colorize(
+            ImageOps.grayscale(rgb), black=(30, 15, 0), white=(255, 220, 170)
+        )
+    elif name == "pixel":
+        blocks = (20, 20)
+        rgb = rgb.resize(blocks, Image.NEAREST).resize(img.size, Image.NEAREST)
+        alpha = alpha.resize(blocks, Image.NEAREST).resize(img.size, Image.NEAREST)
+    result = rgb.convert("RGBA")
+    result.putalpha(alpha)
+    return result
+
+
+def add_outline(img: Image.Image, mode: str) -> Image.Image:
+    if mode not in ("white", "black"):
+        return img
+    color = (255, 255, 255, 255) if mode == "white" else (0, 0, 0, 255)
+    dilated = img.getchannel("A").filter(ImageFilter.MaxFilter(5))
+    layer = Image.new("RGBA", img.size, color)
+    layer.putalpha(dilated)
+    return Image.alpha_composite(layer, img)
+
+
+def draw_caption(img: Image.Image, text: str) -> Image.Image:
+    text = text.strip()
+    if not text:
+        return img
+    draw = ImageDraw.Draw(img)
+    width, height = img.size
+    size = 26
+    font = load_font(size)
+    while size > 8:
+        font = load_font(size)
+        box = draw.textbbox((0, 0), text, font=font, stroke_width=2)
+        if box[2] - box[0] <= width - 6 and box[3] - box[1] <= height // 2:
+            break
+        size -= 2
+    box = draw.textbbox((0, 0), text, font=font, stroke_width=2)
+    x = (width - (box[2] - box[0])) // 2 - box[0]
+    y = height - (box[3] - box[1]) - box[1] - 4
+    draw.text(
+        (x, y),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+        stroke_width=2,
+        stroke_fill=(0, 0, 0, 255),
+    )
+    return img
+
+
+def apply_image_effects(img: Image.Image, settings: UserSettings) -> Image.Image:
+    if settings.cut_bg == "on":
+        img = remove_background(img)
+    img = apply_image_filter(img, settings.image_filter)
+    img = add_outline(img, settings.outline)
+    if settings.text:
+        img = draw_caption(img, settings.text)
+    return img
+
+
 def convert_image_to_png_emoji(
     input_path: Path, output_path: Path, settings: UserSettings
 ) -> bool:
@@ -503,6 +663,7 @@ def convert_image_to_png_emoji(
                 x = (100 - img.width) // 2
                 y = (100 - img.height) // 2
                 result.paste(img, (x, y), img)
+            result = apply_image_effects(result, settings)
             result.save(output_path, format="PNG")
         return True
     except Exception:
@@ -776,8 +937,18 @@ def build_settings_keyboard(settings: UserSettings) -> InlineKeyboardBuilder:
         text=f"Long video: {settings.long_video}",
         callback_data="set:long_video",
     )
+    builder.button(
+        text=f"Filter: {settings.image_filter}",
+        callback_data="set:image_filter",
+    )
+    builder.button(
+        text=f"Outline: {settings.outline}", callback_data="set:outline"
+    )
+    builder.button(
+        text=f"Cut BG: {settings.cut_bg}", callback_data="set:cut_bg"
+    )
     builder.button(text="Reset", callback_data="set:reset")
-    builder.adjust(2, 2, 2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 2, 2, 2, 1, 1)
     return builder
 
 
@@ -834,6 +1005,11 @@ def format_settings(settings: UserSettings) -> str:
         f"- Long video: {settings.long_video} "
         "(trim = cut, speedup = squeeze it all in)\n"
         f"- Trim: {format_trim(settings)} (set with /trim)\n"
+        f"- Filter: {settings.image_filter} "
+        "(none, bw, invert, sepia, pixel)\n"
+        f"- Outline: {settings.outline}\n"
+        f"- Cut background: {settings.cut_bg}\n"
+        f"- Text: {settings.text or 'off'} (set with /text)\n"
         "\nTap buttons to change."
     )
 
@@ -878,8 +1054,16 @@ async def process_image_as_video(
         await message.answer("Video mode not available. 👻✨")
         return
 
+    # Render through the image pipeline first so effects (filter, outline,
+    # background removal, caption) land on the frame before it is encoded.
+    source = input_path
+    if PIL_AVAILABLE:
+        rendered = input_path.with_name("rendered.png")
+        if convert_image_to_png_emoji(input_path, rendered, settings):
+            source = rendered
+
     output_webm = input_path.with_name("emoji.webm")
-    ok = convert_image_to_video_emoji(input_path, output_webm, settings)
+    ok = convert_image_to_video_emoji(source, output_webm, settings)
     if ok:
         await send_file(
             message,
@@ -1308,6 +1492,25 @@ async def handle_trim(message: Message, command: CommandObject) -> None:
     )
 
 
+async def handle_text(message: Message, command: CommandObject) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    settings = get_settings(user_id)
+    raw = (command.args or "").strip()
+
+    if not raw or raw.lower() in {"off", "reset", "none"}:
+        settings.text = ""
+        await message.answer("Caption is off. 👻✨")
+        return
+
+    settings.text = raw[:32]
+    await message.answer(
+        f"Caption set to “{settings.text}”. Send an image. 👻✨"
+    )
+
+
 async def handle_stats(message: Message) -> None:
     config = get_config()
     if not is_admin(message.from_user.id if message.from_user else None, config):
@@ -1478,6 +1681,22 @@ async def handle_settings_callback(query: CallbackQuery) -> None:
         settings.long_video = (
             "speedup" if settings.long_video == "trim" else "trim"
         )
+    elif action == "image_filter":
+        index = (
+            IMAGE_FILTERS.index(settings.image_filter)
+            if settings.image_filter in IMAGE_FILTERS
+            else 0
+        )
+        settings.image_filter = IMAGE_FILTERS[(index + 1) % len(IMAGE_FILTERS)]
+    elif action == "outline":
+        index = (
+            OUTLINE_MODES.index(settings.outline)
+            if settings.outline in OUTLINE_MODES
+            else 0
+        )
+        settings.outline = OUTLINE_MODES[(index + 1) % len(OUTLINE_MODES)]
+    elif action == "cut_bg":
+        settings.cut_bg = "on" if settings.cut_bg == "off" else "off"
     elif action == "reset":
         user_settings[user_id] = UserSettings()
         settings = user_settings[user_id]
@@ -1711,6 +1930,7 @@ async def main() -> None:
     dp.message.register(handle_help, Command("help"))
     dp.message.register(handle_settings, Command("settings"))
     dp.message.register(handle_trim, Command("trim"))
+    dp.message.register(handle_text, Command("text"))
     dp.message.register(handle_me, Command("me"))
     dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))
