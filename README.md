@@ -64,9 +64,29 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 - `/start` - show supported formats.
 - `/help` - short usage info and a link to @Stickers.
 - `/settings` - adjust fit, background, FPS, and duration.
+- `/me` - your personal record: how many emoji you made, your rank, how long you have been using the bot, your favorite format, active days, current streak, and unlocked achievements.
+- `/top` - leaderboard of the most active users, with your own position marked.
 - `/health` - simple health check.
 - `/stats` - usage stats, including uptime (as `2d 7h 33m`), unique user and total request counts (admin only).
 - `/users` - per-user breakdown of who sent requests, how many times, and when they were last seen, ranked by request count (admin only).
+
+## Achievements
+
+Every user collects badges automatically, visible in `/me`:
+
+| Badge | Unlocked by |
+|---|---|
+| 🎬 Debut | first emoji |
+| 🔟 Regular | 10 emoji |
+| 💯 Centurion | 100 emoji |
+| 👑 Emoji royalty | 500 emoji |
+| 🎭 Versatile | using every input format (sticker, photo, GIF, video, file) |
+| 🦇 Night owl | 5 requests after midnight (server time) |
+| 🔥 On fire | 3+ days in a row |
+| 🧙 Veteran | a month since the first request |
+
+The bot also sends a short congratulation when a user hits a milestone
+(1st, 10th, 50th, 100th, 250th, 500th, 1000th emoji).
 
 ## Settings
 

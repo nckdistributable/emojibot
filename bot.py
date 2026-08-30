@@ -8,6 +8,7 @@ import tempfile
 import time
 import zipfile
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +59,25 @@ class UserSettings:
     image_output: str = "static"
 
 
+MAX_ACTIVE_DAYS = 60
+NIGHT_HOUR_END = 6
+MILESTONES = (1, 10, 50, 100, 250, 500, 1000)
+TYPE_LABELS = {
+    "sticker": "stickers",
+    "photo": "photos",
+    "animation": "GIFs",
+    "video": "videos",
+    "document": "files",
+}
+
+
+def parse_day(value: str) -> Optional[date]:
+    try:
+        return date.fromisoformat(value)
+    except Exception:
+        return None
+
+
 @dataclass
 class UserStat:
     user_id: int
@@ -65,6 +85,10 @@ class UserStat:
     full_name: str = ""
     count: int = 0
     last_seen: float = 0.0
+    first_seen: float = 0.0
+    night_count: int = 0
+    types: dict[str, int] = field(default_factory=dict)
+    days: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -78,7 +102,7 @@ class Stats:
         self.counts[key] = self.counts.get(key, 0) + 1
         self.save()
 
-    def record_user(self, user: Optional[User]) -> None:
+    def record_user(self, user: Optional[User], kind: str = "") -> None:
         if user is None:
             return
         stat = self.users.get(user.id)
@@ -89,8 +113,23 @@ class Stats:
             stat.username = user.username
         if user.full_name:
             stat.full_name = user.full_name
+
+        now = time.time()
+        if stat.first_seen <= 0:
+            stat.first_seen = now
         stat.count += 1
-        stat.last_seen = time.time()
+        stat.last_seen = now
+        if kind:
+            stat.types[kind] = stat.types.get(kind, 0) + 1
+
+        local = time.localtime(now)
+        if local.tm_hour < NIGHT_HOUR_END:
+            stat.night_count += 1
+        today = time.strftime("%Y-%m-%d", local)
+        if not stat.days or stat.days[-1] != today:
+            stat.days.append(today)
+            del stat.days[:-MAX_ACTIVE_DAYS]
+
         self.save()
 
     def to_dict(self) -> dict:
@@ -103,6 +142,10 @@ class Stats:
                     "full_name": u.full_name,
                     "count": u.count,
                     "last_seen": u.last_seen,
+                    "first_seen": u.first_seen,
+                    "night_count": u.night_count,
+                    "types": u.types,
+                    "days": u.days,
                 }
                 for uid, u in self.users.items()
             },
@@ -158,12 +201,31 @@ def load_stats(path: Optional[Path]) -> Stats:
                 continue
             try:
                 user_id = int(info.get("user_id", raw_id))
+                types: dict[str, int] = {}
+                raw_types = info.get("types")
+                if isinstance(raw_types, dict):
+                    for key, value in raw_types.items():
+                        try:
+                            types[str(key)] = int(value)
+                        except Exception:
+                            continue
+                days: list[str] = []
+                raw_days = info.get("days")
+                if isinstance(raw_days, list):
+                    for value in raw_days:
+                        if isinstance(value, str) and parse_day(value) is not None:
+                            days.append(value)
+                    days = sorted(set(days))[-MAX_ACTIVE_DAYS:]
                 stats.users[user_id] = UserStat(
                     user_id=user_id,
                     username=str(info.get("username", "")),
                     full_name=str(info.get("full_name", "")),
                     count=int(info.get("count", 0)),
                     last_seen=float(info.get("last_seen", 0.0)),
+                    first_seen=float(info.get("first_seen", 0.0)),
+                    night_count=int(info.get("night_count", 0)),
+                    types=types,
+                    days=days,
                 )
             except Exception:
                 continue
@@ -754,7 +816,8 @@ async def handle_help(message: Message) -> None:
     text = (
         "Send a sticker, animated sticker, image, GIF, or video. 👻✨\n"
         "I will return a file you can upload to @Stickers. 👻✨\n"
-        "Use /settings to tweak fit, background, FPS, and duration. 👻✨"
+        "Use /settings to tweak fit, background, FPS, and duration. 👻✨\n"
+        "Use /me for your own record and /top for the leaderboard. 👻✨"
     )
     await message.answer(text, reply_markup=build_help_keyboard().as_markup())
 
@@ -798,6 +861,82 @@ def format_last_seen(last_seen: float) -> str:
     return f"{format_duration(delta)} ago"
 
 
+def current_streak(days: list[str]) -> int:
+    parsed = {d for d in (parse_day(v) for v in days) if d is not None}
+    if not parsed:
+        return 0
+    today = date.today()
+    cursor = today
+    if cursor not in parsed:
+        # A streak stays alive until the day after the last active day.
+        cursor = today - timedelta(days=1)
+        if cursor not in parsed:
+            return 0
+    streak = 0
+    while cursor in parsed:
+        streak += 1
+        cursor -= timedelta(days=1)
+    return streak
+
+
+def favorite_type(stat: UserStat) -> str:
+    if not stat.types:
+        return "nothing yet"
+    kind, hits = max(stat.types.items(), key=lambda item: item[1])
+    return f"{TYPE_LABELS.get(kind, kind)} ({hits})"
+
+
+def ranked_users() -> list[UserStat]:
+    return sorted(
+        stats.users.values(), key=lambda u: (u.count, u.last_seen), reverse=True
+    )
+
+
+def user_rank(user_id: int) -> Optional[int]:
+    for index, stat in enumerate(ranked_users(), start=1):
+        if stat.user_id == user_id:
+            return index
+    return None
+
+
+def achievements(stat: UserStat) -> list[str]:
+    earned: list[str] = []
+    if stat.count >= 1:
+        earned.append("🎬 Debut - first emoji made")
+    if stat.count >= 10:
+        earned.append("🔟 Regular - 10 emoji")
+    if stat.count >= 100:
+        earned.append("💯 Centurion - 100 emoji")
+    if stat.count >= 500:
+        earned.append("👑 Emoji royalty - 500 emoji")
+    if len(stat.types) >= len(TYPE_LABELS):
+        earned.append("🎭 Versatile - tried every format")
+    if stat.night_count >= 5:
+        earned.append("🦇 Night owl - 5 requests after midnight")
+    streak = current_streak(stat.days)
+    if streak >= 3:
+        earned.append(f"🔥 On fire - {streak} days in a row")
+    if stat.first_seen > 0 and time.time() - stat.first_seen >= 30 * 86400:
+        earned.append("🧙 Veteran - a month with me")
+    return earned
+
+
+def milestone_text(count: int) -> str:
+    if count == 1:
+        return "🎉 Your very first emoji! Welcome aboard. 👻✨"
+    return f"🎉 That is your {count}th emoji! Keep summoning. 👻✨"
+
+
+async def track_request(message: Message, kind: str) -> None:
+    user = message.from_user
+    stats.record_user(user, kind)
+    if user is None:
+        return
+    stat = stats.users.get(user.id)
+    if stat and stat.count in MILESTONES:
+        await message.answer(milestone_text(stat.count))
+
+
 async def handle_stats(message: Message) -> None:
     config = get_config()
     if not is_admin(message.from_user.id if message.from_user else None, config):
@@ -830,9 +969,7 @@ async def handle_users(message: Message) -> None:
     if not stats.users:
         await message.answer("No requests yet. The void stares back. 👻✨")
         return
-    ranked = sorted(
-        stats.users.values(), key=lambda u: (u.count, u.last_seen), reverse=True
-    )
+    ranked = ranked_users()
     total = sum(u.count for u in ranked)
     header = f"Users: {len(ranked)} | Requests: {total}"
     lines = [header]
@@ -845,6 +982,78 @@ async def handle_users(message: Message) -> None:
     if len(ranked) > limit:
         lines.append(f"... and {len(ranked) - limit} more")
     await message.answer("\n".join(lines) + "\nWho's been summoning me? 👻✨")
+
+
+async def handle_me(message: Message) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    stat = stats.users.get(user_id)
+    if stat is None or stat.count == 0:
+        await message.answer(
+            "You have not summoned anything yet. Send me a sticker, image, "
+            "GIF, or video to get started. 👻✨"
+        )
+        return
+
+    rank = user_rank(user_id)
+    lines = [f"{format_user_label(stat)} - your spooky record 👻"]
+    if rank:
+        lines.append(f"Emoji made: {stat.count} (#{rank} of {len(stats.users)})")
+    else:
+        lines.append(f"Emoji made: {stat.count}")
+    if stat.first_seen > 0:
+        lines.append(f"With me for: {format_duration(time.time() - stat.first_seen)}")
+    lines.append(f"Last seen: {format_last_seen(stat.last_seen)}")
+    lines.append(f"Favorite format: {favorite_type(stat)}")
+    lines.append(f"Active days: {len(stat.days)}")
+    streak = current_streak(stat.days)
+    if streak:
+        day_word = "day" if streak == 1 else "days"
+        lines.append(f"Current streak: {streak} {day_word} 🔥")
+
+    earned = achievements(stat)
+    if earned:
+        lines.append("")
+        lines.append("Achievements:")
+        lines.extend(earned)
+
+    next_milestone = next((m for m in MILESTONES if m > stat.count), None)
+    if next_milestone:
+        lines.append("")
+        lines.append(
+            f"{next_milestone - stat.count} more to reach {next_milestone}. 👻✨"
+        )
+
+    await message.answer("\n".join(lines))
+
+
+async def handle_top(message: Message) -> None:
+    config = get_config()
+    if await reject_if_not_allowed(message, config):
+        return
+    ranked = ranked_users()
+    if not ranked:
+        await message.answer("Nobody on the board yet. Be the first. 👻✨")
+        return
+
+    user_id = message.from_user.id if message.from_user else 0
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = ["Top summoners 👻"]
+    top_n = 10
+    for index, stat in enumerate(ranked[:top_n], start=1):
+        marker = medals.get(index, f"{index}.")
+        suffix = " ← you" if stat.user_id == user_id else ""
+        lines.append(f"{marker} {format_user_label(stat)} - {stat.count}{suffix}")
+
+    rank = user_rank(user_id)
+    if rank and rank > top_n:
+        own = stats.users[user_id]
+        lines.append("...")
+        lines.append(f"{rank}. {format_user_label(own)} - {own.count} ← you")
+
+    await message.answer("\n".join(lines) + "\nUse /me for your own record. 👻✨")
 
 
 async def handle_health(message: Message) -> None:
@@ -917,7 +1126,7 @@ async def handle_sticker(message: Message, bot: Bot) -> None:
         )
         return
 
-    stats.record_user(message.from_user)
+    await track_request(message, "sticker")
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
 
@@ -974,7 +1183,7 @@ async def handle_photo(message: Message, bot: Bot) -> None:
         )
         return
     stats.inc("photo_in")
-    stats.record_user(message.from_user)
+    await track_request(message, "photo")
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
     file = await bot.get_file(photo.file_id)
@@ -1000,7 +1209,7 @@ async def handle_animation(message: Message, bot: Bot) -> None:
         )
         return
     stats.inc("animation_in")
-    stats.record_user(message.from_user)
+    await track_request(message, "animation")
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
     file = await bot.get_file(animation.file_id)
@@ -1028,7 +1237,7 @@ async def handle_video(message: Message, bot: Bot) -> None:
         )
         return
     stats.inc("video_in")
-    stats.record_user(message.from_user)
+    await track_request(message, "video")
     user_id = message.from_user.id if message.from_user else 0
     settings = get_settings(user_id)
     file = await bot.get_file(video.file_id)
@@ -1056,7 +1265,7 @@ async def handle_document(message: Message, bot: Bot) -> None:
         )
         return
     stats.inc("document_in")
-    stats.record_user(message.from_user)
+    await track_request(message, "document")
     mime = (doc.mime_type or "").lower()
     doc_duration = getattr(doc, "duration", None)
     user_id = message.from_user.id if message.from_user else 0
@@ -1112,6 +1321,8 @@ async def main() -> None:
     dp.message.register(handle_start, CommandStart())
     dp.message.register(handle_help, Command("help"))
     dp.message.register(handle_settings, Command("settings"))
+    dp.message.register(handle_me, Command("me"))
+    dp.message.register(handle_top, Command("top"))
     dp.message.register(handle_stats, Command("stats"))
     dp.message.register(handle_users, Command("users"))
     dp.message.register(handle_health, Command("health"))
