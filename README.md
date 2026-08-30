@@ -50,6 +50,26 @@ docker compose up --build
    - if video emoji limits are not met — `.mp4` or `.gif`
 3. Add the file to an emoji set via @Stickers.
 
+### Building a real emoji pack
+
+The bot can assemble the pack itself, so you never have to visit @Stickers:
+
+```
+/pack new Halloween     start collecting
+  ... send images, videos, albums, sheets ...
+/pack emoji 🔥          tag the next additions with this emoji
+/pack status            what is in it so far
+/pack finish            close it and get the link
+```
+
+While a pack is open, every emoji the bot produces is appended to a real
+Telegram custom emoji set created in your name, and you get a
+`t.me/addemoji/...` link you can share. `.png`, `.webm` and `.tgs` results are
+added; `.mp4`/`.gif` fallbacks and archives are skipped, since Telegram does
+not accept them as emoji.
+
+`/pack cancel` stops adding but keeps whatever was already put in the set.
+
 ### Sending a link
 
 Paste a public `http(s)` link to an image, GIF, or video and the bot fetches
@@ -133,6 +153,7 @@ the video-emoji limits, the bot falls back to a `.png` static emoji.
 - `/trim` - pick which part of a clip to use (`/trim 2-5`, `/trim 2`, `/trim off`).
 - `/text` - draw a caption on the emoji (`/text BOO!`, `/text off`).
 - `/sheet` - slice a grid image into animation frames (`/sheet 4x3`, `/sheet off`).
+- `/pack` - build a real Telegram emoji pack (`/pack new <title>`, `/pack finish`).
 - `/me` - your personal record: how many emoji you made, your rank, how long you have been using the bot, your favorite format, active days, current streak, and unlocked achievements.
 - `/top` - leaderboard of the most active users, with your own position marked.
 - `/health` - simple health check.
