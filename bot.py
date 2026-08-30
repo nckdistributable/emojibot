@@ -771,13 +771,43 @@ async def handle_settings(message: Message) -> None:
     )
 
 
+def format_duration(seconds: float) -> str:
+    total = int(max(0, seconds))
+    days, rest = divmod(total, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    # Seconds only matter below the hour mark; above that they are just noise.
+    if (secs and total < 3600) or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def format_last_seen(last_seen: float) -> str:
+    if last_seen <= 0:
+        return "never"
+    delta = time.time() - last_seen
+    if delta < 60:
+        return "just now"
+    return f"{format_duration(delta)} ago"
+
+
 async def handle_stats(message: Message) -> None:
     config = get_config()
     if not is_admin(message.from_user.id if message.from_user else None, config):
         return
-    uptime = int(time.monotonic() - stats.start_time)
+    uptime = time.monotonic() - stats.start_time
     total_requests = sum(u.count for u in stats.users.values())
-    lines = [f"Uptime: {uptime}s", f"unique_users: {len(stats.users)}"]
+    lines = [
+        f"Uptime: {format_duration(uptime)}",
+        f"unique_users: {len(stats.users)}",
+    ]
     if total_requests:
         lines.append(f"total_requests: {total_requests}")
     for key in sorted(stats.counts.keys()):
@@ -808,7 +838,10 @@ async def handle_users(message: Message) -> None:
     lines = [header]
     limit = 50
     for stat in ranked[:limit]:
-        lines.append(f"{format_user_label(stat)} (id {stat.user_id}): {stat.count}")
+        lines.append(
+            f"{format_user_label(stat)} (id {stat.user_id}): {stat.count}"
+            f" | last seen {format_last_seen(stat.last_seen)}"
+        )
     if len(ranked) > limit:
         lines.append(f"... and {len(ranked) - limit} more")
     await message.answer("\n".join(lines) + "\nWho's been summoning me? 👻✨")
